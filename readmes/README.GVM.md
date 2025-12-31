@@ -77,7 +77,7 @@ RedAmon uses GVM in **headless API mode** (no web GUI) to:
 │            ▼                                                                        │
 │   ┌─────────────────┐                                                               │
 │   │   JSON OUTPUT   │  Structured vulnerability report                              │
-│   │                 │  └── vuln_scan/output/vuln_*.json                             │
+│   │                 │  └── gvm_scan/output/vuln_*.json                              │
 │   └─────────────────┘                                                               │
 │                                                                                     │
 └─────────────────────────────────────────────────────────────────────────────────────┘
@@ -468,7 +468,7 @@ These containers download vulnerability data and exit immediately. They populate
            ▼
 10. OUTPUT
    ┌────────────────┐
-   │ vuln_scan/     │
+   │ gvm_scan/      │
    │ output/        │
    │ vuln_*.json    │
    └────────────────┘
@@ -594,7 +594,7 @@ Each scan config defines:
 ### GVMScanner Class
 
 ```python
-from vuln_scan.gvm_scanner import GVMScanner
+from gvm_scan.gvm_scanner import GVMScanner
 
 # Initialize
 scanner = GVMScanner(
@@ -717,6 +717,143 @@ scanner.disconnect()
 
 ---
 
+## Updating Vulnerability Data
+
+GVM's vulnerability detection relies on regularly updated feeds from Greenbone. Understanding how to update these feeds is critical for effective scanning.
+
+### How GVM Gets Vulnerability Data
+
+GVM does **NOT calculate CVSS scores** - it retrieves pre-calculated scores from external sources:
+
+| Data Source | What It Provides | Origin |
+|-------------|------------------|--------|
+| **NIST NVD** | CVE definitions, CVSS scores | National Vulnerability Database |
+| **Greenbone Feed** | 170,000+ NVT scripts | Greenbone Security |
+| **CERT-Bund** | German CERT advisories | BSI (German Federal Office) |
+| **DFN-CERT** | Research network advisories | German Research Network |
+
+### Feed Architecture in Docker
+
+RedAmon uses **data containers** that download feeds once and populate Docker volumes:
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        GVM FEED UPDATE FLOW                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│   DATA CONTAINERS (run once, exit)                                      │
+│   ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐        │
+│   │ vulnerability-  │  │   scap-data     │  │  cert-bund-data │        │
+│   │     tests       │  │                 │  │                 │        │
+│   │                 │  │  CVE/CVSS from  │  │  German CERT    │        │
+│   │  170K+ NVTs     │  │  NIST NVD       │  │  Advisories     │        │
+│   └────────┬────────┘  └────────┬────────┘  └────────┬────────┘        │
+│            │                    │                    │                  │
+│            ▼                    ▼                    ▼                  │
+│   ┌─────────────────────────────────────────────────────────────┐      │
+│   │                    DOCKER VOLUMES                            │      │
+│   │   vt_data (~2GB)   scap_data (~500MB)   cert_data (~100MB)  │      │
+│   └─────────────────────────────────────────────────────────────┘      │
+│            │                    │                    │                  │
+│            └────────────────────┼────────────────────┘                  │
+│                                 ▼                                       │
+│                        ┌─────────────────┐                             │
+│                        │      GVMD       │                             │
+│                        │  Syncs feeds to │                             │
+│                        │   PostgreSQL    │                             │
+│                        └─────────────────┘                             │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Manual Feed Update (Recommended Weekly)
+
+Since data containers only run once on first startup, you need to manually trigger updates:
+
+```bash
+# Step 1: Pull latest feed images (contains new vulnerability data)
+docker compose pull vulnerability-tests notus-data scap-data \
+                    cert-bund-data dfn-cert-data data-objects report-formats
+
+# Step 2: Re-run data containers to update volumes
+docker compose up vulnerability-tests notus-data scap-data \
+                  cert-bund-data dfn-cert-data data-objects report-formats
+
+# Step 3: Restart gvmd to reload updated feeds
+docker compose restart gvmd
+
+# Step 4: Wait for sync to complete (watch logs)
+docker compose logs -f gvmd
+# Look for: "Updating VTs in database ... done"
+```
+
+### What Each Feed Contains
+
+| Container | Volume | Size | Update Frequency | Contents |
+|-----------|--------|------|------------------|----------|
+| `vulnerability-tests` | `vt_data` | ~2 GB | Daily | 170,000+ NASL vulnerability test scripts |
+| `scap-data` | `scap_data` | ~500 MB | Daily | CVE definitions, CVSS scores, CPE dictionary |
+| `cert-bund-data` | `cert_data` | ~50 MB | Daily | German CERT security advisories |
+| `dfn-cert-data` | `cert_data` | ~50 MB | Daily | DFN-CERT research network advisories |
+| `notus-data` | `notus_data` | ~200 MB | Daily | Package version → CVE mappings |
+| `data-objects` | `data_objects` | ~10 MB | Weekly | Scan configs, port lists, policies |
+| `report-formats` | `data_objects` | ~5 MB | Rarely | Report output templates |
+| `gpg-data` | `gpg_data` | ~1 MB | Rarely | Feed signature verification keys |
+
+### CVSS Score Source
+
+GVM's `severity` field in scan results **IS the CVSS score** (0.0-10.0 float):
+
+```python
+# In gvm_scanner.py - severity comes directly from NVD via SCAP feed
+severity = result.get('severity')  # e.g., 9.8
+severity_class = classify_severity(severity)  # "critical"
+```
+
+**Severity Classification:**
+```
+CVSS 9.0-10.0  →  Critical
+CVSS 7.0-8.9   →  High
+CVSS 4.0-6.9   →  Medium
+CVSS 0.1-3.9   →  Low
+CVSS 0.0       →  Log/Info
+```
+
+### Update Frequency Recommendations
+
+| Scenario | Update Frequency | Command |
+|----------|------------------|---------|
+| Regular assessments | Weekly | Full update (all containers) |
+| Critical CVE announced | Immediately | Full update |
+| Before important scan | Same day | Full update |
+| Compliance audit | Day before | Full update + verify sync |
+
+### Verifying Feed Status
+
+```bash
+# Check NVT count in database
+docker compose exec pg-gvm psql -U gvmd -d gvmd -c "SELECT count(*) FROM nvts;"
+# Expected: ~170,000+
+
+# Check feed version
+docker compose exec gvmd gvmd --get-feeds
+
+# Check SCAP data
+docker compose exec pg-gvm psql -U gvmd -d gvmd -c "SELECT count(*) FROM scap.cves;"
+# Expected: ~250,000+
+```
+
+### Troubleshooting Feed Updates
+
+| Issue | Solution |
+|-------|----------|
+| "Feed sync in progress" | Wait 10-20 minutes, check gvmd logs |
+| Outdated NVT count | Re-run data containers, restart gvmd |
+| "VT not found" errors | Feed sync incomplete, wait or re-sync |
+| Disk space issues | GVM needs ~20GB; clean Docker: `docker system prune` |
+
+---
+
 ## Maintenance & Operations
 
 ### Daily Operations
@@ -728,11 +865,10 @@ scanner.disconnect()
 # Check disk space
 docker system df
 
-# Update vulnerability feeds
-docker compose down
-docker volume rm redamon_vt_data redamon_scap_data redamon_cert_data \
-                 redamon_notus_data redamon_data_objects redamon_gpg_data
-docker compose up -d
+# Update vulnerability feeds (recommended method)
+docker compose pull vulnerability-tests notus-data scap-data cert-bund-data dfn-cert-data data-objects report-formats
+docker compose up vulnerability-tests notus-data scap-data cert-bund-data dfn-cert-data data-objects report-formats
+docker compose restart gvmd
 ```
 
 ### Monthly Tasks
@@ -873,12 +1009,11 @@ RedAmon/
 ├── params.py                   # Configuration parameters
 ├── .env                        # Secrets (GVM_PASSWORD)
 │
-├── vuln_scan/
+├── gvm_scan/
 │   ├── __init__.py             # Package marker
 │   ├── main.py                 # Entry point
-│   ├── gvm_scanner.py          # GVM API wrapper (681 lines)
+│   ├── gvm_scanner.py          # GVM API wrapper
 │   ├── requirements.txt        # Python dependencies
-│   ├── README.GVM.md           # This documentation
 │   └── output/
 │       └── vuln_*.json         # Scan results
 │
@@ -904,7 +1039,7 @@ docker compose --profile scanner up python-scanner
 
 ### Check Results
 ```bash
-cat vuln_scan/output/vuln_*.json | jq '.summary'
+cat gvm_scan/output/vuln_*.json | jq '.summary'
 ```
 
 ### Stop System

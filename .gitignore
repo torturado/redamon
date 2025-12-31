@@ -93,9 +93,9 @@ dmypy.json
 
 # Recon output files (contain sensitive scan data)
 recon/output/*.json
-vuln_scan/output/*.json
+gvm_scan/output/*.json
 !recon/output/.gitkeep
-!vuln_scan/output/.gitkeep
+!gvm_scan/output/.gitkeep
 
 # Nmap scan results
 *.nmap

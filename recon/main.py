@@ -25,10 +25,9 @@ from params import (
     TARGET_DOMAIN,
     USE_TOR_FOR_RECON,
     USE_BRUTEFORCE_FOR_SUBDOMAINS,
-    GITHUB_HUNTER_ENABLED,
+    SCAN_MODULES,
     GITHUB_ACCESS_TOKEN,
     GITHUB_TARGET_ORG,
-    NMAP_ENABLED,
 )
 
 # Import recon modules
@@ -36,6 +35,7 @@ from recon.whois_recon import whois_lookup
 from recon.domain_recon import discover_subdomains
 from recon.github_secret_hunt import GitHubSecretHunter
 from recon.nmap_scan import run_nmap_scan
+from recon.nuclei_scan import run_nuclei_scan
 
 # Output directory
 OUTPUT_DIR = Path(__file__).parent / "output"
@@ -70,12 +70,16 @@ def parse_target(target: str) -> dict:
 
 def build_scan_type() -> str:
     """Build dynamic scan type based on enabled modules."""
-    modules = ["domain_recon"]
-    if NMAP_ENABLED:
+    modules = []
+    if "initial_recon" in SCAN_MODULES:
+        modules.append("domain_recon")
+    if "nmap" in SCAN_MODULES:
         modules.append("nmap")
-    if GITHUB_HUNTER_ENABLED:
+    if "nuclei" in SCAN_MODULES:
+        modules.append("nuclei")
+    if "github" in SCAN_MODULES:
         modules.append("github")
-    return "_".join(modules)
+    return "_".join(modules) if modules else "custom"
 
 
 def save_recon_file(data: dict, output_file: Path):
@@ -218,9 +222,15 @@ def run_domain_recon(target: str, anonymous: bool = False, bruteforce: bool = Fa
     print(f"[+] Saved: {output_file}")
 
     # Step 4: Nmap port scanning (enriches the data, saves incrementally)
-    if NMAP_ENABLED:
+    if "nmap" in SCAN_MODULES:
         combined_result = run_nmap_scan(combined_result, output_file=output_file)
         combined_result["metadata"]["modules_executed"].append("nmap_scan")
+        save_recon_file(combined_result, output_file)
+
+    # Step 5: Nuclei vulnerability scanning (enriches the data, saves incrementally)
+    if "nuclei" in SCAN_MODULES:
+        combined_result = run_nuclei_scan(combined_result, output_file=output_file)
+        combined_result["metadata"]["modules_executed"].append("nuclei_scan")
         save_recon_file(combined_result, output_file)
 
     print(f"\n{'=' * 70}")
@@ -229,11 +239,16 @@ def run_domain_recon(target: str, anonymous: bool = False, bruteforce: bool = Fa
         print(f"[+] Mode: Subdomain only ({target})")
     else:
         print(f"[+] Subdomains found: {combined_result['subdomain_count']}")
-    if NMAP_ENABLED and "nmap" in combined_result:
+    if "nmap" in SCAN_MODULES and "nmap" in combined_result:
         nmap_data = combined_result["nmap"]
         summary = nmap_data.get("summary", {})
         total_ports = summary.get("total_tcp_ports", 0) + summary.get("total_udp_ports", 0)
         print(f"[+] Open ports found: {total_ports}")
+    if "nuclei" in SCAN_MODULES and "nuclei" in combined_result:
+        nuclei_data = combined_result["nuclei"]
+        nuclei_summary = nuclei_data.get("summary", {})
+        nuclei_vulns = nuclei_data.get("vulnerabilities", {}).get("total", 0)
+        print(f"[+] Nuclei findings: {nuclei_summary.get('total_findings', 0)} ({nuclei_vulns} vulnerabilities)")
     print(f"[+] Output saved: {output_file}")
     print(f"{'=' * 70}")
 
@@ -307,19 +322,51 @@ def main():
             print("[!] Anonymity module not found, proceeding without Tor status check")
 
     # Phase 1 & 2: Domain recon (WHOIS + Subdomains + DNS) - Combined JSON
-    domain_result = run_domain_recon(
-        TARGET_DOMAIN,
-        anonymous=USE_TOR_FOR_RECON,
-        bruteforce=USE_BRUTEFORCE_FOR_SUBDOMAINS,
-        target_info=target_info
-    )
+    output_file = Path(__file__).parent / "output" / f"recon_{TARGET_DOMAIN}.json"
+    
+    if "initial_recon" in SCAN_MODULES:
+        domain_result = run_domain_recon(
+            TARGET_DOMAIN,
+            anonymous=USE_TOR_FOR_RECON,
+            bruteforce=USE_BRUTEFORCE_FOR_SUBDOMAINS,
+            target_info=target_info
+        )
+    else:
+        # Load existing recon file if initial_recon not in modules
+        if output_file.exists():
+            import json
+            with open(output_file, 'r') as f:
+                domain_result = json.load(f)
+            print(f"[*] Loaded existing recon file: {output_file}")
+        else:
+            print(f"[!] No existing recon file found: {output_file}")
+            print(f"[!] Add 'initial_recon' to SCAN_MODULES to create it first")
+            return 1
+        
+        # Run nmap if in SCAN_MODULES (when initial_recon is skipped)
+        if "nmap" in SCAN_MODULES:
+            domain_result = run_nmap_scan(domain_result, output_file=output_file)
+            if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
+                if "nmap_scan" not in domain_result["metadata"]["modules_executed"]:
+                    domain_result["metadata"]["modules_executed"].append("nmap_scan")
+            with open(output_file, 'w') as f:
+                json.dump(domain_result, f, indent=2)
+        
+        # Run nuclei if in SCAN_MODULES (when initial_recon is skipped)
+        if "nuclei" in SCAN_MODULES:
+            domain_result = run_nuclei_scan(domain_result, output_file=output_file)
+            if "metadata" in domain_result and "modules_executed" in domain_result["metadata"]:
+                if "nuclei_scan" not in domain_result["metadata"]["modules_executed"]:
+                    domain_result["metadata"]["modules_executed"].append("nuclei_scan")
+            with open(output_file, 'w') as f:
+                json.dump(domain_result, f, indent=2)
 
     # Phase 3: GitHub secret hunt - Separate JSON (if enabled)
     github_findings = []
-    if GITHUB_HUNTER_ENABLED:
+    if "github" in SCAN_MODULES:
         github_findings = run_github_recon(GITHUB_ACCESS_TOKEN, GITHUB_TARGET_ORG)
     else:
-        print("\n[*] GitHub Secret Hunt: DISABLED (set GITHUB_HUNTER_ENABLED=True to enable)")
+        print("\n[*] GitHub Secret Hunt: SKIPPED (add 'github' to SCAN_MODULES to enable)")
 
     # Final summary
     end_time = datetime.now()
@@ -339,7 +386,7 @@ def main():
         print(f"║  Subdomains found: {domain_result['subdomain_count']}" + " " * (48 - len(str(domain_result['subdomain_count']))) + "║")
 
     # Nmap stats
-    if NMAP_ENABLED and "nmap" in domain_result:
+    if "nmap" in SCAN_MODULES and "nmap" in domain_result:
         nmap_data = domain_result["nmap"]
         summary = nmap_data.get("summary", {})
         ips_scanned = summary.get("ips_scanned", 0)
@@ -347,20 +394,35 @@ def main():
         total_ports = summary.get("total_tcp_ports", 0) + summary.get("total_udp_ports", 0)
         nmap_info = f"{ips_scanned} IPs, {hostnames_scanned} hosts, {total_ports} ports"
         print(f"║  Nmap: {nmap_info}" + " " * (60 - len(nmap_info)) + "║")
-    else:
-        nmap_status = "DISABLED" if not NMAP_ENABLED else "N/A"
-        print(f"║  Nmap scan: {nmap_status}" + " " * (55 - len(nmap_status)) + "║")
+    elif "nmap" not in SCAN_MODULES:
+        print(f"║  Nmap scan: SKIPPED" + " " * 48 + "║")
 
-    github_status = str(len(github_findings)) if GITHUB_HUNTER_ENABLED else "DISABLED"
+    # Nuclei stats
+    if "nuclei" in SCAN_MODULES and "nuclei" in domain_result:
+        nuclei_data = domain_result["nuclei"]
+        nuclei_summary = nuclei_data.get("summary", {})
+        total_findings = nuclei_summary.get("total_findings", 0)
+        crit = nuclei_summary.get("critical", 0)
+        high = nuclei_summary.get("high", 0)
+        nuclei_info = f"{total_findings} findings"
+        if crit > 0 or high > 0:
+            nuclei_info += f" ({crit} critical, {high} high)"
+        print(f"║  Nuclei: {nuclei_info}" + " " * (58 - len(nuclei_info)) + "║")
+    elif "nuclei" not in SCAN_MODULES:
+        print(f"║  Nuclei scan: SKIPPED" + " " * 46 + "║")
+
+    github_status = str(len(github_findings)) if "github" in SCAN_MODULES else "SKIPPED"
     print(f"║  GitHub findings: {github_status}" + " " * (49 - len(github_status)) + "║")
     print("╠" + "═" * 68 + "╣")
     print("║  Output Files:" + " " * 53 + "║")
-    nmap_suffix = " + Nmap" if NMAP_ENABLED else ""
+    nmap_suffix = " + Nmap" if "nmap" in SCAN_MODULES else ""
+    nuclei_suffix = " + Nuclei" if "nuclei" in SCAN_MODULES else ""
+    all_suffixes = nmap_suffix + nuclei_suffix
     if is_subdomain_mode:
-        print(f"║    • recon_{TARGET_DOMAIN}.json (WHOIS + DNS{nmap_suffix})" + " " * max(0, 18 - len(TARGET_DOMAIN) - len(nmap_suffix)) + "║")
+        print(f"║    • recon_{TARGET_DOMAIN}.json (WHOIS + DNS{all_suffixes})" + " " * max(0, 18 - len(TARGET_DOMAIN) - len(all_suffixes)) + "║")
     else:
-        print(f"║    • recon_{TARGET_DOMAIN}.json (WHOIS + DNS + Subs{nmap_suffix})" + " " * max(0, 12 - len(TARGET_DOMAIN) - len(nmap_suffix)) + "║")
-    if GITHUB_HUNTER_ENABLED:
+        print(f"║    • recon_{TARGET_DOMAIN}.json (WHOIS + DNS + Subs{all_suffixes})" + " " * max(0, 10 - len(TARGET_DOMAIN) - len(all_suffixes)) + "║")
+    if "github" in SCAN_MODULES:
         print(f"║    • github_secrets_{GITHUB_TARGET_ORG}.json" + " " * max(0, 24 - len(GITHUB_TARGET_ORG)) + "║")
     print("╚" + "═" * 68 + "╝")
     print()

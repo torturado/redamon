@@ -9,8 +9,8 @@ against discovered IPs and hostnames using GVM.
 
 Usage:
     # From project root (with GVM running in Docker):
-    python vuln_scan/main.py
-    
+    python gvm_scan/main.py
+
     # Or run via Docker Compose:
     docker compose --profile scanner up python-scanner
 """
@@ -28,9 +28,12 @@ from params import (
     TARGET_DOMAIN,
     GVM_SCAN_TARGETS,
     GVM_CLEANUP_AFTER_SCAN,
+    USE_RECON_FOR_TARGET,
+    GVM_IP_LIST,
+    GVM_HOSTNAME_LIST,
 )
 
-from vuln_scan.gvm_scanner import (
+from gvm_scan.gvm_scanner import (
     GVMScanner,
     extract_targets_from_recon,
     load_recon_file,
@@ -64,32 +67,46 @@ def run_vulnerability_scan(
     print("=" * 70)
     print(f"  Target Domain: {domain}")
     print(f"  Scan Strategy: {scan_targets}")
+    print(f"  Use Recon Data: {USE_RECON_FOR_TARGET}")
     print(f"  Cleanup After: {cleanup}")
     print("=" * 70 + "\n")
-    
+
     # Check if GVM library is available
     if not GVM_AVAILABLE:
         print("[!] ERROR: python-gvm library not installed")
         print("[!] Install with: pip install python-gvm")
         return {"error": "python-gvm not installed"}
-    
-    # Load recon data
-    print("[*] Loading recon data...")
-    try:
-        recon_data = load_recon_file(domain)
-        print(f"    [+] Loaded: recon_{domain}.json")
-    except FileNotFoundError as e:
-        print(f"[!] ERROR: {e}")
-        print(f"[!] Run domain recon first: python recon/main.py")
-        return {"error": str(e)}
-    
-    # Extract targets
-    ips, hostnames = extract_targets_from_recon(recon_data)
+
+    # Get targets based on USE_RECON_FOR_TARGET setting
+    if USE_RECON_FOR_TARGET:
+        # Load recon data
+        print("[*] Loading recon data...")
+        try:
+            recon_data = load_recon_file(domain)
+            print(f"    [+] Loaded: recon_{domain}.json")
+        except FileNotFoundError as e:
+            print(f"[!] ERROR: {e}")
+            print(f"[!] Run domain recon first: python recon/main.py")
+            return {"error": str(e)}
+
+        # Extract targets from recon
+        ips, hostnames = extract_targets_from_recon(recon_data)
+    else:
+        # Use manual target lists from params
+        print("[*] Using manual target lists from params.py...")
+        ips = set(GVM_IP_LIST)
+        hostnames = set(GVM_HOSTNAME_LIST)
+        print(f"    [+] GVM_IP_LIST: {len(ips)} IPs")
+        print(f"    [+] GVM_HOSTNAME_LIST: {len(hostnames)} hostnames")
+
     print(f"    [+] Found {len(ips)} unique IPs")
     print(f"    [+] Found {len(hostnames)} unique hostnames")
     
     if not ips and not hostnames:
-        print("[!] No targets found in recon data")
+        if USE_RECON_FOR_TARGET:
+            print("[!] No targets found in recon data")
+        else:
+            print("[!] No targets specified in GVM_IP_LIST or GVM_HOSTNAME_LIST")
         return {"error": "No targets found"}
     
     # Initialize results structure
@@ -99,7 +116,9 @@ def run_vulnerability_scan(
             "scan_timestamp": datetime.now().isoformat(),
             "target_domain": domain,
             "scan_strategy": scan_targets,
-            "recon_file": f"recon_{domain}.json",
+            "use_recon_for_target": USE_RECON_FOR_TARGET,
+            "target_source": "recon_data" if USE_RECON_FOR_TARGET else "manual_lists",
+            "recon_file": f"recon_{domain}.json" if USE_RECON_FOR_TARGET else None,
             "targets": {
                 "ips": list(ips),
                 "hostnames": list(hostnames)
@@ -124,7 +143,7 @@ def run_vulnerability_scan(
     if not scanner.connect():
         print("[!] ERROR: Failed to connect to GVM")
         print("[!] Make sure GVM is running:")
-        print("[!]   cd vuln_scan && docker compose up -d")
+        print("[!]   docker compose up -d")
         print("[!]   docker compose logs -f gvmd  # Wait for 'Starting GVMd'")
         return {"error": "Failed to connect to GVM"}
     
@@ -193,7 +212,8 @@ def run_vulnerability_scan(
                     for sev, count in hostname_results["severity_summary"].items():
                         results["summary"][sev] += count
                 results["summary"]["total_vulnerabilities"] += hostname_results.get("vulnerability_count", 0)
-                
+                results["summary"]["hosts_scanned"] += hostname_results.get("hosts_scanned", 0)
+
                 # Save after each hostname
                 save_incremental()
                 print(f"    [+] Progress saved to {output_file}")

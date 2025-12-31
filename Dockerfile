@@ -14,19 +14,19 @@ LABEL description="Python-based GVM vulnerability scanner for RedAmon"
 WORKDIR /app
 
 # Install dependencies (only python-gvm needed for scanner)
-COPY vuln_scan/requirements.txt .
+COPY gvm_scan/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy project files
 COPY params.py .
-COPY vuln_scan/ ./vuln_scan/
+COPY gvm_scan/ ./gvm_scan/
 
 # Create output directory
-RUN mkdir -p vuln_scan/output recon/output
+RUN mkdir -p gvm_scan/output recon/output
 
 # Set Python path
 ENV PYTHONPATH=/app
 
 # Default command
-CMD ["python", "vuln_scan/main.py"]
+CMD ["python", "gvm_scan/main.py"]
 

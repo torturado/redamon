@@ -124,6 +124,10 @@ services:
         condition: service_completed_successfully
 
   # OSPD-OpenVAS scanner (creates the socket gvmd expects)
+  # NOTE: The pcap errors for callback-based detection (Log4Shell, etc.) are
+  # expected in Docker bridge networking. Most vulnerability detection still
+  # works via version checks and response analysis. Using network_mode: host
+  # would break socket communication with other containers.
   ospd-openvas:
     image: registry.community.greenbone.net/community/ospd-openvas:stable
     container_name: redamon-gvm-ospd
@@ -161,7 +165,7 @@ services:
     volumes:
       - gvmd_socket:/run/gvmd:ro
       - ./recon/output:/app/recon/output:ro
-      - ./vuln_scan/output:/app/vuln_scan/output
+      - ./gvm_scan/output:/app/gvm_scan/output
     depends_on:
       - gvmd
       - ospd-openvas

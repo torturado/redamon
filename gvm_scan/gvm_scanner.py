@@ -15,9 +15,17 @@ import json
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Any, Union
 from xml.etree import ElementTree as ET
 import sys
+
+# XML to dict conversion for complete data extraction
+try:
+    import xmltodict
+    XMLTODICT_AVAILABLE = True
+except ImportError:
+    XMLTODICT_AVAILABLE = False
+    print("[!] xmltodict not installed. Run: pip install xmltodict")
 
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -351,124 +359,282 @@ class GVMScanner:
     
     def get_report(self, report_id: str) -> Dict:
         """
-        Fetch and parse a scan report.
-        
+        Fetch and parse a scan report with full details.
+
         Args:
             report_id: Report ID to fetch
-            
+
         Returns:
-            Parsed report as dictionary
+            Parsed report as dictionary with enhanced data including:
+            - Full raw XML converted to JSON (raw_data)
+            - Computed/enriched fields (severity_class, unique_cves, etc.)
         """
-        report = self.gmp.get_report(
+        # Request report with full details including notes and overrides
+        report_xml = self.gmp.get_report(
             report_id=report_id,
             report_format_id=self.xml_format_id,
             ignore_pagination=True,
             details=True
         )
-        return self._parse_report_xml(report)
+        return self._parse_report_full(report_xml)
     
-    def _parse_report_xml(self, report_xml: ET.Element) -> Dict:
+    def _parse_report_full(self, report_xml: ET.Element) -> Dict:
         """
-        Parse GVM XML report into structured dictionary.
-        
+        Parse GVM XML report using xmltodict for complete data extraction,
+        then enrich with computed fields.
+
         Args:
             report_xml: XML Element from GVM
-            
+
         Returns:
-            Structured report dictionary
+            Complete report with:
+            - raw_data: Full XML converted to JSON (no data loss)
+            - Computed summary fields for easy access
+            - Enriched vulnerability list with severity classifications
         """
-        results = []
-        
-        for result in report_xml.findall('.//result'):
-            severity_text = self._get_text(result, 'severity')
-            try:
-                severity = float(severity_text) if severity_text else 0.0
-            except ValueError:
-                severity = 0.0
-            
-            # Extract NVT OID safely (ElementTree doesn't support @attribute XPath)
-            nvt_element = result.find('.//nvt')
-            nvt_oid = nvt_element.get('oid') if nvt_element is not None else None
-            
-            vuln = {
-                "id": result.get('id'),
-                "name": self._get_text(result, 'name'),
-                "host": self._parse_host(result),
-                "port": self._get_text(result, 'port'),
-                "severity": severity,
-                "severity_class": self._classify_severity(severity),
-                "threat": self._get_text(result, 'threat'),
-                "description": self._get_text(result, 'description'),
-                "solution": self._get_text(result, 'solution'),
-                "nvt": {
-                    "oid": nvt_oid,
-                    "name": self._get_text(result, './/nvt/name'),
-                    "family": self._get_text(result, './/nvt/family'),
-                    "cvss_base": self._get_text(result, './/nvt/cvss_base'),
-                },
-                "cves": self._extract_cves(result),
-                "references": self._extract_refs(result),
-                "qod": {
-                    "value": self._get_text(result, './/qod/value'),
-                    "type": self._get_text(result, './/qod/type'),
-                }
-            }
-            results.append(vuln)
-        
-        # Sort by severity (highest first)
-        results.sort(key=lambda x: x['severity'], reverse=True)
-        
-        # Build summary statistics
-        severity_counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "log": 0}
-        hosts_affected = set()
-        
-        for r in results:
-            severity_counts[r['severity_class']] += 1
-            if r['host']:
-                hosts_affected.add(r['host'])
-        
-        # Try to get hosts scanned from report host count (more accurate)
-        hosts_count = 0
-        hosts_element = report_xml.find('.//hosts')
-        if hosts_element is not None:
-            count_text = hosts_element.find('count')
-            if count_text is not None and count_text.text:
-                try:
-                    hosts_count = int(count_text.text)
-                except ValueError:
-                    pass
-        
-        # Fallback to hosts with results, or report host count
-        hosts_scanned = max(len(hosts_affected), hosts_count)
-        
+        # Convert XML to string for xmltodict
+        xml_string = ET.tostring(report_xml, encoding='unicode')
+
+        # Convert to dict using xmltodict - captures ALL fields
+        if XMLTODICT_AVAILABLE:
+            raw_data = xmltodict.parse(xml_string, attr_prefix='@', cdata_key='#text')
+        else:
+            # Fallback: use basic ElementTree conversion
+            raw_data = self._element_to_dict(report_xml)
+
+        # Extract the report from response wrapper
+        report_data = self._extract_report_data(raw_data)
+
+        # Compute enriched summary fields
+        summary = self._compute_summary(report_data)
+
         return {
-            "report_id": self._get_report_id(report_xml),
-            "scan_start": self._get_text(report_xml, './/scan_start'),
-            "scan_end": self._get_text(report_xml, './/scan_end'),
-            "hosts_scanned": hosts_scanned,
-            "vulnerability_count": len(results),
-            "severity_summary": severity_counts,
-            "vulnerabilities": results
+            # Metadata
+            "report_id": summary.get("report_id"),
+            "scan_start": summary.get("scan_start"),
+            "scan_end": summary.get("scan_end"),
+            "scan_run_status": summary.get("scan_run_status"),
+
+            # Computed statistics
+            "hosts_scanned": summary.get("hosts_scanned", 0),
+            "vulnerability_count": summary.get("vulnerability_count", 0),
+            "severity_summary": summary.get("severity_summary", {}),
+            "unique_cves": summary.get("unique_cves", []),
+            "unique_cve_count": summary.get("unique_cve_count", 0),
+            "ports_affected": summary.get("ports_affected", []),
+
+            # Enriched vulnerabilities with severity_class
+            "vulnerabilities": summary.get("vulnerabilities", []),
+
+            # Complete raw data - ALL GVM fields preserved
+            "raw_data": report_data
         }
-    
-    def _get_report_id(self, report_xml: ET.Element) -> Optional[str]:
-        """Extract report ID from XML."""
-        report = report_xml.find('.//report')
-        return report.get('id') if report is not None else None
-    
-    def _parse_host(self, result: ET.Element) -> Optional[str]:
-        """Parse host from result, handling nested structure."""
-        host = result.find('host')
-        if host is not None:
-            # Check for nested text or asset
-            if host.text:
-                return host.text.strip()
-            # Some versions nest the IP differently
-            asset = host.find('asset')
-            if asset is not None:
-                return asset.get('id')
-        return None
-    
+
+    def _extract_report_data(self, raw_data: Dict) -> Dict:
+        """
+        Extract the report data from GMP response wrapper.
+
+        Args:
+            raw_data: Full xmltodict output
+
+        Returns:
+            The actual report data
+        """
+        # Navigate through possible wrapper structures
+        if 'get_reports_response' in raw_data:
+            response = raw_data['get_reports_response']
+            if 'report' in response:
+                report_wrapper = response['report']
+                # Handle nested report structure
+                if isinstance(report_wrapper, dict) and 'report' in report_wrapper:
+                    return report_wrapper
+                return {'report': report_wrapper}
+        elif 'get_report_response' in raw_data:
+            response = raw_data['get_report_response']
+            if 'report' in response:
+                return response
+        # Return as-is if structure not recognized
+        return raw_data
+
+    def _compute_summary(self, report_data: Dict) -> Dict:
+        """
+        Compute summary statistics and enrich vulnerabilities.
+
+        Args:
+            report_data: Extracted report data
+
+        Returns:
+            Summary dictionary with computed fields
+        """
+        summary = {
+            "report_id": None,
+            "scan_start": None,
+            "scan_end": None,
+            "scan_run_status": None,
+            "hosts_scanned": 0,
+            "vulnerability_count": 0,
+            "severity_summary": {"critical": 0, "high": 0, "medium": 0, "low": 0, "log": 0},
+            "unique_cves": [],
+            "unique_cve_count": 0,
+            "ports_affected": [],
+            "vulnerabilities": []
+        }
+
+        # Navigate to the inner report
+        report = report_data.get('report', {})
+        if isinstance(report, dict) and 'report' in report:
+            inner_report = report.get('report', {})
+        else:
+            inner_report = report
+
+        # Extract metadata
+        summary["report_id"] = report.get('@id') or self._safe_get(report, 'id')
+        summary["scan_start"] = self._safe_get(inner_report, 'scan_start')
+        summary["scan_end"] = self._safe_get(inner_report, 'scan_end')
+        summary["scan_run_status"] = self._safe_get(inner_report, 'scan_run_status')
+
+        # Get hosts count
+        hosts_data = self._safe_get(inner_report, 'hosts')
+        if isinstance(hosts_data, dict):
+            summary["hosts_scanned"] = self._safe_int(hosts_data.get('count', 0))
+
+        # Extract and enrich results
+        results_data = self._safe_get(inner_report, 'results', {})
+        results_list = self._safe_get(results_data, 'result', [])
+
+        # Ensure results_list is a list
+        if isinstance(results_list, dict):
+            results_list = [results_list]
+        elif not isinstance(results_list, list):
+            results_list = []
+
+        unique_cves = set()
+        ports_affected = set()
+        enriched_vulns = []
+
+        for result in results_list:
+            if not isinstance(result, dict):
+                continue
+
+            # Get severity and classify
+            severity = self._safe_float(self._safe_get(result, 'severity', 0))
+            severity_class = self._classify_severity(severity)
+            summary["severity_summary"][severity_class] += 1
+
+            # Extract CVEs
+            cves = self._extract_cves_from_dict(result)
+            unique_cves.update(cves)
+
+            # Extract port
+            port = self._safe_get(result, 'port')
+            if port:
+                ports_affected.add(port)
+
+            # Create enriched vulnerability entry
+            enriched_vuln = {
+                **result,  # Keep all original fields
+                "severity_float": severity,
+                "severity_class": severity_class,
+                "cves_extracted": cves,
+            }
+            enriched_vulns.append(enriched_vuln)
+
+        # Sort by severity (highest first)
+        enriched_vulns.sort(key=lambda x: x.get('severity_float', 0), reverse=True)
+
+        summary["vulnerability_count"] = len(enriched_vulns)
+        summary["vulnerabilities"] = enriched_vulns
+        summary["unique_cves"] = sorted(list(unique_cves))
+        summary["unique_cve_count"] = len(unique_cves)
+        summary["ports_affected"] = sorted(list(ports_affected))
+
+        return summary
+
+    def _extract_cves_from_dict(self, result: Dict) -> List[str]:
+        """
+        Extract CVE identifiers from a result dictionary.
+
+        Args:
+            result: Result dictionary from xmltodict
+
+        Returns:
+            List of CVE identifiers
+        """
+        cves = []
+
+        # Check nvt/refs/ref structure
+        nvt = self._safe_get(result, 'nvt', {})
+        refs = self._safe_get(nvt, 'refs', {})
+        ref_list = self._safe_get(refs, 'ref', [])
+
+        if isinstance(ref_list, dict):
+            ref_list = [ref_list]
+
+        for ref in ref_list:
+            if isinstance(ref, dict):
+                ref_type = ref.get('@type', '')
+                ref_id = ref.get('@id', '')
+                if ref_type.lower() == 'cve' and ref_id:
+                    cves.append(ref_id)
+
+        return cves
+
+    def _element_to_dict(self, element: ET.Element) -> Dict:
+        """
+        Fallback: Convert ElementTree element to dict (basic conversion).
+
+        Args:
+            element: XML Element
+
+        Returns:
+            Dictionary representation
+        """
+        result = {}
+
+        # Add attributes
+        if element.attrib:
+            result['@attributes'] = dict(element.attrib)
+
+        # Add text content
+        if element.text and element.text.strip():
+            result['#text'] = element.text.strip()
+
+        # Add children
+        for child in element:
+            child_dict = self._element_to_dict(child)
+            if child.tag in result:
+                # Convert to list if multiple same-named children
+                if not isinstance(result[child.tag], list):
+                    result[child.tag] = [result[child.tag]]
+                result[child.tag].append(child_dict)
+            else:
+                result[child.tag] = child_dict
+
+        return result if result else (element.text.strip() if element.text else None)
+
+    @staticmethod
+    def _safe_get(data: Any, key: str, default: Any = None) -> Any:
+        """Safely get a key from dict-like data."""
+        if isinstance(data, dict):
+            return data.get(key, default)
+        return default
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """Safely convert value to int."""
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        """Safely convert value to float."""
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return default
+
     def _classify_severity(self, severity: float) -> str:
         """Classify severity score into category."""
         if severity >= 9.0:
@@ -480,35 +646,7 @@ class GVMScanner:
         elif severity > 0.0:
             return "low"
         return "log"
-    
-    def _extract_cves(self, result: ET.Element) -> List[str]:
-        """Extract CVE identifiers from result."""
-        cves = []
-        for ref in result.findall('.//ref'):
-            ref_type = ref.get('type', '')
-            ref_id = ref.get('id', '')
-            if ref_type.lower() == 'cve' and ref_id:
-                cves.append(ref_id)
-        return cves
-    
-    def _extract_refs(self, result: ET.Element) -> List[Dict]:
-        """Extract all references from result."""
-        refs = []
-        for ref in result.findall('.//ref'):
-            refs.append({
-                "type": ref.get('type', ''),
-                "id": ref.get('id', '')
-            })
-        return refs
-    
-    @staticmethod
-    def _get_text(element: ET.Element, path: str) -> Optional[str]:
-        """Safely get text from XML element."""
-        el = element.find(path)
-        if el is not None and el.text:
-            return el.text.strip()
-        return None
-    
+
     def delete_target(self, target_id: str):
         """Delete a target from GVM."""
         try:
@@ -687,7 +825,7 @@ def save_vuln_results(
         Path to saved file
     """
     if output_dir is None:
-        output_dir = PROJECT_ROOT / "vuln_scan" / "output"
+        output_dir = PROJECT_ROOT / "gvm_scan" / "output"
     
     output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / f"vuln_{domain}.json"
