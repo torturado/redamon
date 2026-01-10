@@ -6,8 +6,10 @@ and Neo4j graph database integration.
 """
 
 import os
+import re
 import logging
 from typing import Optional, List
+from contextvars import ContextVar
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -18,11 +20,16 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langchain_neo4j import Neo4jGraph, GraphCypherQAChain
+from langchain_neo4j import Neo4jGraph
 
 from state import AgentState, InvokeResponse
 from utils import create_config, get_config_values, set_checkpointer
 from params import OPENAI_MODEL, MCP_CURL_URL, CREATE_GRAPH_IMAGRE_ON_INIT
+from prompts import TEXT_TO_CYPHER_SYSTEM
+
+# Context variables to pass user_id and project_id to tools
+_current_user_id: ContextVar[str] = ContextVar('current_user_id', default='')
+_current_project_id: ContextVar[str] = ContextVar('current_project_id', default='')
 
 checkpointer = MemorySaver()
 set_checkpointer(checkpointer)
@@ -61,7 +68,6 @@ class AgentOrchestrator:
         self.llm_with_tools: Optional[ChatOpenAI] = None
         self.mcp_client: Optional[MultiServerMCPClient] = None
         self.neo4j_graph: Optional[Neo4jGraph] = None
-        self.cypher_chain: Optional[GraphCypherQAChain] = None
         self.tools: List = []
         self.graph = None
 
@@ -123,11 +129,142 @@ class AgentOrchestrator:
             logger.error(f"Failed to connect to MCP server: {e}")
             logger.warning("Continuing without MCP tools")
 
+    def _inject_tenant_filter(self, cypher: str, user_id: str, project_id: str) -> str:
+        """
+        Inject mandatory user_id and project_id filters into a Cypher query.
+
+        This ensures all queries are scoped to the current user's project,
+        preventing cross-tenant data access.
+
+        Args:
+            cypher: The AI-generated Cypher query
+            user_id: Current user's ID
+            project_id: Current project's ID
+
+        Returns:
+            Modified Cypher query with tenant filters applied
+        """
+        # Find all node variable declarations in MATCH clauses
+        # Pattern matches: (variable:Label) or (variable:Label {props})
+        node_pattern = r'\((\w+):(\w+)(?:\s*\{[^}]*\})?\)'
+
+        # Node types that require tenant filtering (exclude CVE which is global)
+        tenant_nodes = {
+            'Domain', 'Subdomain', 'IP', 'Port', 'Service', 'BaseURL',
+            'Technology', 'Vulnerability', 'Endpoint', 'Parameter',
+            'Header', 'DNSRecord', 'Certificate', 'MitreData', 'Capec'
+        }
+
+        # Find all node variables that need filtering
+        matches = re.findall(node_pattern, cypher)
+        filter_vars = []
+        for var_name, label in matches:
+            if label in tenant_nodes:
+                filter_vars.append(var_name)
+
+        if not filter_vars:
+            return cypher
+
+        # Build the tenant filter clause
+        tenant_conditions = []
+        for var in set(filter_vars):  # Use set to avoid duplicates
+            tenant_conditions.append(f"{var}.user_id = $tenant_user_id")
+            tenant_conditions.append(f"{var}.project_id = $tenant_project_id")
+
+        tenant_filter = " AND ".join(tenant_conditions)
+
+        # Inject the filter into the query
+        # If WHERE exists, add to it; otherwise insert WHERE before RETURN/WITH/ORDER/LIMIT
+        if re.search(r'\bWHERE\b', cypher, re.IGNORECASE):
+            # Add to existing WHERE clause
+            cypher = re.sub(
+                r'(\bWHERE\b\s+)',
+                rf'\1({tenant_filter}) AND ',
+                cypher,
+                count=1,
+                flags=re.IGNORECASE
+            )
+        else:
+            # Insert WHERE before RETURN, WITH, ORDER BY, or LIMIT
+            insert_pattern = r'(\s*)(RETURN|WITH|ORDER\s+BY|LIMIT)'
+            match = re.search(insert_pattern, cypher, re.IGNORECASE)
+            if match:
+                insert_pos = match.start()
+                cypher = cypher[:insert_pos] + f" WHERE {tenant_filter} " + cypher[insert_pos:]
+
+        return cypher
+
+    def _execute_filtered_query(self, cypher: str, user_id: str, project_id: str) -> str:
+        """
+        Execute a Cypher query with tenant parameters.
+
+        Args:
+            cypher: The Cypher query to execute
+            user_id: Current user's ID
+            project_id: Current project's ID
+
+        Returns:
+            Query results as a string
+        """
+        try:
+            result = self.neo4j_graph.query(
+                cypher,
+                params={
+                    "tenant_user_id": user_id,
+                    "tenant_project_id": project_id
+                }
+            )
+            if not result:
+                return "No results found"
+            return str(result)
+        except Exception as e:
+            logger.error(f"Query execution error: {e}")
+            return f"Error executing query: {str(e)}"
+
+    def _generate_cypher(self, question: str) -> str:
+        """
+        Use LLM to generate a Cypher query from natural language.
+
+        Args:
+            question: Natural language question about the data
+
+        Returns:
+            Generated Cypher query string
+        """
+        schema = self.neo4j_graph.get_schema
+
+        prompt = f"""{TEXT_TO_CYPHER_SYSTEM}
+
+## Current Database Schema
+{schema}
+
+## Important
+- Generate ONLY the Cypher query, no explanations
+- Do NOT include user_id or project_id filters - they will be added automatically
+- Always use LIMIT to restrict results
+
+User Question: {question}
+
+Cypher Query:"""
+
+        response = self.llm.invoke(prompt)
+        cypher = response.content.strip()
+
+        # Clean up the response - remove markdown code blocks if present
+        if cypher.startswith("```"):
+            lines = cypher.split("\n")
+            cypher = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+
+        return cypher.strip()
+
     def _setup_graph_tools(self) -> None:
         """
-        Set up Neo4j text-to-cypher tool.
+        Set up Neo4j text-to-cypher tool with mandatory tenant filtering.
 
-        Creates a tool that converts natural language to Cypher queries.
+        Creates a tool that:
+        1. Converts natural language to Cypher using LLM
+        2. Injects mandatory user_id and project_id filters
+        3. Executes the filtered query against Neo4j
         """
         logger.info(f"Setting up Neo4j connection to {self.neo4j_uri}")
 
@@ -138,13 +275,8 @@ class AgentOrchestrator:
                 password=self.neo4j_password
             )
 
-            self.cypher_chain = GraphCypherQAChain.from_llm(
-                llm=self.llm,
-                graph=self.neo4j_graph,
-                verbose=True,
-                return_intermediate_steps=True,
-                allow_dangerous_requests=True
-            )
+            # Store reference to self for use in the tool closure
+            orchestrator = self
 
             @tool
             def query_graph(question: str) -> str:
@@ -164,14 +296,35 @@ class AgentOrchestrator:
                 Returns:
                     Query results as a string
                 """
+                # Get current user/project from context
+                user_id = _current_user_id.get()
+                project_id = _current_project_id.get()
+
+                if not user_id or not project_id:
+                    return "Error: Missing user_id or project_id context"
+
+                logger.info(f"[{user_id}/{project_id}] Generating Cypher for: {question[:50]}...")
+
                 try:
-                    result = self.cypher_chain.invoke({"query": question})
-                    return str(result.get("result", "No results found"))
+                    # Step 1: Generate Cypher from natural language
+                    cypher = orchestrator._generate_cypher(question)
+                    logger.info(f"[{user_id}/{project_id}] Generated Cypher: {cypher}")
+
+                    # Step 2: Inject mandatory tenant filters
+                    filtered_cypher = orchestrator._inject_tenant_filter(cypher, user_id, project_id)
+                    logger.info(f"[{user_id}/{project_id}] Filtered Cypher: {filtered_cypher}")
+
+                    # Step 3: Execute the filtered query
+                    result = orchestrator._execute_filtered_query(filtered_cypher, user_id, project_id)
+
+                    return result
+
                 except Exception as e:
+                    logger.error(f"[{user_id}/{project_id}] Query error: {e}")
                     return f"Error querying graph: {str(e)}"
 
             self.tools.append(query_graph)
-            logger.info("Neo4j graph query tool configured")
+            logger.info("Neo4j graph query tool configured with tenant filtering")
 
         except Exception as e:
             logger.error(f"Failed to set up Neo4j: {e}")
@@ -305,6 +458,10 @@ class AgentOrchestrator:
             raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Invoking with: {question[:50]}...")
+
+        # Set context variables for tenant filtering in graph queries
+        _current_user_id.set(user_id)
+        _current_project_id.set(project_id)
 
         try:
             config = create_config(user_id, project_id, session_id)
