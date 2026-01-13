@@ -1,25 +1,62 @@
 """
 RedAmon Agent Orchestrator
 
-Main agent class that orchestrates LangGraph execution with MCP tools
-and Neo4j graph database integration.
+ReAct-style agent orchestrator with iterative Thought-Tool-Output pattern.
+Supports phase tracking, LLM-managed todo lists, and checkpoint-based approval.
 """
 
 import os
+import re
+import json
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
-from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
-from state import AgentState, InvokeResponse
-from utils import create_config, get_config_values, set_checkpointer
-from params import OPENAI_MODEL, CREATE_GRAPH_IMAGRE_ON_INIT
-from tools import MCPToolsManager, Neo4jToolManager, set_tenant_context
+from state import (
+    AgentState,
+    InvokeResponse,
+    ExecutionStep,
+    TodoItem,
+    TargetInfo,
+    PhaseTransitionRequest,
+    PhaseHistoryEntry,
+    LLMDecision,
+    OutputAnalysis,
+    ExtractedTargetInfo,
+    create_initial_state,
+    format_todo_list,
+    format_execution_trace,
+    summarize_trace_for_response,
+    utc_now,
+)
+from utils import create_config, get_config_values, get_identifiers, set_checkpointer
+from params import (
+    OPENAI_MODEL,
+    CREATE_GRAPH_IMAGRE_ON_INIT,
+    MAX_ITERATIONS,
+    REQUIRE_APPROVAL_FOR_EXPLOITATION,
+    REQUIRE_APPROVAL_FOR_POST_EXPLOITATION,
+    TOOL_OUTPUT_MAX_CHARS,
+)
+from tools import (
+    MCPToolsManager,
+    Neo4jToolManager,
+    PhaseAwareToolExecutor,
+    set_tenant_context,
+    set_phase_context,
+)
+from prompts import (
+    REACT_SYSTEM_PROMPT,
+    OUTPUT_ANALYSIS_PROMPT,
+    PHASE_TRANSITION_MESSAGE,
+    FINAL_REPORT_PROMPT,
+    get_phase_tools,
+)
 
 checkpointer = MemorySaver()
 set_checkpointer(checkpointer)
@@ -31,14 +68,13 @@ logger = logging.getLogger(__name__)
 
 class AgentOrchestrator:
     """
-    Main orchestrator for the RedAmon agent system.
+    ReAct-style agent orchestrator for penetration testing.
 
-    Combines:
-    - LangGraph for state management and flow control
-    - MCP tools (curl) for HTTP requests
-    - Neo4j text-to-cypher for graph queries
-    - OpenAI GPT-4.1 for reasoning
-    - MemorySaver checkpointer for session persistence
+    Implements the Thought-Tool-Output pattern with:
+    - Phase tracking (Informational → Exploitation → Post-Exploitation)
+    - LLM-managed todo lists
+    - Checkpoint-based approval for phase transitions
+    - Full execution trace in memory
     """
 
     def __init__(self):
@@ -50,33 +86,28 @@ class AgentOrchestrator:
         self.neo4j_password = os.getenv("NEO4J_PASSWORD")
 
         self.llm: Optional[ChatOpenAI] = None
-        self.llm_with_tools: Optional[ChatOpenAI] = None
-        self.tools: List = []
+        self.tool_executor: Optional[PhaseAwareToolExecutor] = None
         self.graph = None
 
         self._initialized = False
 
     async def initialize(self) -> None:
-        """
-        Initialize all components asynchronously.
-
-        Must be called before invoke().
-        """
+        """Initialize all components asynchronously."""
         if self._initialized:
             logger.warning("Orchestrator already initialized")
             return
+
         logger.info("Initializing AgentOrchestrator...")
 
         self._setup_llm()
         await self._setup_tools()
-        self.llm_with_tools = self.llm.bind_tools(self.tools)
         self._build_graph()
         self._initialized = True
 
         if CREATE_GRAPH_IMAGRE_ON_INIT:
             self._save_graph_image()
 
-        logger.info(f"AgentOrchestrator initialized with {len(self.tools)} tools")
+        logger.info("AgentOrchestrator initialized with ReAct pattern")
 
     def _setup_llm(self) -> None:
         """Initialize the OpenAI LLM."""
@@ -92,7 +123,6 @@ class AgentOrchestrator:
         # Setup MCP tools
         mcp_manager = MCPToolsManager()
         mcp_tools = await mcp_manager.get_tools()
-        self.tools.extend(mcp_tools)
 
         # Setup Neo4j graph query tool
         neo4j_manager = Neo4jToolManager(
@@ -102,46 +132,86 @@ class AgentOrchestrator:
             llm=self.llm
         )
         graph_tool = neo4j_manager.get_tool()
-        if graph_tool:
-            self.tools.append(graph_tool)
+
+        # Create phase-aware tool executor
+        self.tool_executor = PhaseAwareToolExecutor(mcp_manager, graph_tool)
+        self.tool_executor.register_mcp_tools(mcp_tools)
+
+        logger.info(f"Tools initialized: {len(self.tool_executor.get_all_tools())} available")
 
     def _build_graph(self) -> None:
-        """
-        Build the LangGraph StateGraph with MemorySaver checkpointer.
-
-        Flow: START -> agent -> tools (conditional) -> response -> END
-        The response node generates a natural language answer from tool output.
-        The checkpointer automatically handles session persistence.
-        """
-        logger.info("Building LangGraph StateGraph with MemorySaver checkpointer")
+        """Build the ReAct LangGraph with phase tracking."""
+        logger.info("Building ReAct LangGraph...")
 
         builder = StateGraph(AgentState)
-        builder.add_node("agent", self._agent_node)
-        builder.add_node("tools", ToolNode(self.tools))
-        builder.add_node("response", self._response_node)
 
-        builder.add_edge(START, "agent")
+        # Add nodes
+        builder.add_node("initialize", self._initialize_node)
+        builder.add_node("think", self._think_node)
+        builder.add_node("execute_tool", self._execute_tool_node)
+        builder.add_node("analyze_output", self._analyze_output_node)
+        builder.add_node("await_approval", self._await_approval_node)
+        builder.add_node("process_approval", self._process_approval_node)
+        builder.add_node("generate_response", self._generate_response_node)
+
+        # Entry point
+        builder.add_edge(START, "initialize")
+
+        # Route after initialize - either process approval or continue to think
         builder.add_conditional_edges(
-            "agent",
-            self._should_use_tool,
+            "initialize",
+            self._route_after_initialize,
             {
-                "tools": "tools",
-                "end": END
+                "process_approval": "process_approval",
+                "think": "think",
             }
         )
-        builder.add_edge("tools", "response")
-        builder.add_edge("response", END)
+
+        # Main routing from think node
+        builder.add_conditional_edges(
+            "think",
+            self._route_after_think,
+            {
+                "execute_tool": "execute_tool",
+                "await_approval": "await_approval",
+                "generate_response": "generate_response",
+            }
+        )
+
+        # Tool execution flow
+        builder.add_edge("execute_tool", "analyze_output")
+
+        # After analysis, continue loop or end
+        builder.add_conditional_edges(
+            "analyze_output",
+            self._route_after_analyze,
+            {
+                "think": "think",
+                "generate_response": "generate_response",
+            }
+        )
+
+        # Approval flow - pause for user input
+        builder.add_edge("await_approval", END)
+
+        # Process approval routes back to think or ends
+        builder.add_conditional_edges(
+            "process_approval",
+            self._route_after_approval,
+            {
+                "think": "think",
+                "generate_response": "generate_response",
+            }
+        )
+
+        # Final response always ends
+        builder.add_edge("generate_response", END)
 
         self.graph = builder.compile(checkpointer=checkpointer)
-        logger.info("LangGraph compiled with MemorySaver checkpointer")
+        logger.info("ReAct LangGraph compiled with checkpointer")
 
     def _save_graph_image(self) -> None:
-        """
-        Save the LangGraph structure as a PNG image.
-
-        The image is saved to the agentic folder as 'graph_structure.png'.
-        Requires pygraphviz or grandalf for rendering.
-        """
+        """Save the LangGraph structure as a PNG image."""
         try:
             current_dir = os.path.dirname(os.path.abspath(__file__))
             image_path = os.path.join(current_dir, "graph_structure.png")
@@ -151,75 +221,638 @@ class AgentOrchestrator:
                 f.write(png_data)
 
             logger.info(f"Graph structure image saved to {image_path}")
-
         except Exception as e:
             logger.warning(f"Could not save graph image: {e}")
 
-    async def _agent_node(self, state: AgentState, config: Optional[dict] = None) -> dict:
-        """
-        Main reasoning node - LLM decides which tool to use.
+    # =========================================================================
+    # LANGGRAPH NODES
+    # =========================================================================
 
-        Args:
-            state: Current agent state
-            config: Contains configurable with user_id, project_id, session_id
-
-        Returns:
-            Updated state with LLM response
-        """
-        config = config or {}
+    async def _initialize_node(self, state: AgentState, config = None) -> dict:
+        """Initialize state for new conversation or update for continuation."""
         user_id, project_id, session_id = get_config_values(config)
-        logger.info(f"[{user_id}/{project_id}/{session_id}] Agent node processing...")
 
-        response = await self.llm_with_tools.ainvoke(state["messages"])
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Initializing state...")
 
-        logger.debug(f"[{user_id}/{project_id}/{session_id}] LLM response type: {type(response)}")
+        # If resuming after approval, preserve approval state for routing
+        if state.get("user_approval_response") and state.get("phase_transition_pending"):
+            logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with approval response: {state.get('user_approval_response')}")
+            # Don't modify approval-related fields - let process_approval handle them
+            return {
+                "user_id": user_id,
+                "project_id": project_id,
+                "session_id": session_id,
+            }
 
-        if hasattr(response, 'tool_calls') and response.tool_calls:
-            tool_name = response.tool_calls[0].get('name', 'unknown')
-            logger.info(f"[{user_id}/{project_id}/{session_id}] Tool selected: {tool_name}")
+        # Extract objective from latest user message
+        messages = state.get("messages", [])
+        objective = ""
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                objective = msg.content
+                break
 
-        return {"messages": [response]}
+        # Initialize or preserve state fields
+        return {
+            "current_iteration": state.get("current_iteration", 0),
+            "max_iterations": state.get("max_iterations", MAX_ITERATIONS),
+            "task_complete": False,
+            "current_phase": state.get("current_phase", "informational"),
+            "phase_history": state.get("phase_history", [
+                PhaseHistoryEntry(phase="informational").model_dump()
+            ]),
+            "execution_trace": state.get("execution_trace", []),
+            "todo_list": state.get("todo_list", []),
+            "original_objective": state.get("original_objective") or objective,
+            "target_info": state.get("target_info", TargetInfo().model_dump()),
+            "user_id": user_id,
+            "project_id": project_id,
+            "session_id": session_id,
+            "awaiting_user_approval": False,
+            "phase_transition_pending": None,
+        }
 
-    def _should_use_tool(self, state: AgentState) -> str:
+    async def _think_node(self, state: AgentState, config = None) -> dict:
         """
-        Determine if we should route to tools or end.
+        Core ReAct reasoning node.
 
-        Args:
-            state: Current agent state
-
-        Returns:
-            "tools" if tool calls present, "end" otherwise
+        Analyzes previous steps, updates todo list, and decides next action.
         """
-        last_message = state["messages"][-1]
+        user_id, project_id, session_id = get_identifiers(state, config)
 
-        if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-            return "tools"
+        iteration = state.get("current_iteration", 0) + 1
+        phase = state.get("current_phase", "informational")
 
-        return "end"
+        # Check if we just transitioned - log and clear the marker
+        just_transitioned = state.get("_just_transitioned_to")
+        if just_transitioned:
+            logger.info(f"[{user_id}/{project_id}/{session_id}] Just transitioned to {just_transitioned}, now in phase: {phase}")
 
-    async def _response_node(self, state: AgentState, config: Optional[dict] = None) -> dict:
-        """
-        Response node - generates a natural language answer from tool output.
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Think node - iteration {iteration}, phase: {phase}")
 
-        This node takes the tool output and asks the LLM to create a
-        human-friendly response summarizing the results.
+        # Set context for tools
+        set_tenant_context(user_id, project_id)
+        set_phase_context(phase)
 
-        Args:
-            state: Current agent state (contains tool output in messages)
-            config: Contains configurable with user_id, project_id, session_id
+        # Build the prompt with current state
+        system_prompt = REACT_SYSTEM_PROMPT.format(
+            current_phase=phase,
+            available_tools=get_phase_tools(phase),
+            iteration=iteration,
+            max_iterations=state.get("max_iterations", MAX_ITERATIONS),
+            objective=state.get("original_objective", "No objective specified"),
+            execution_trace=format_execution_trace(state.get("execution_trace", [])),
+            todo_list=format_todo_list(state.get("todo_list", [])),
+            target_info=json.dumps(state.get("target_info", {}), indent=2),
+        )
 
-        Returns:
-            Updated state with natural language response
-        """
-        config = config or {}
-        user_id, project_id, session_id = get_config_values(config)
-        logger.info(f"[{user_id}/{project_id}/{session_id}] Response node processing...")
+        # Get LLM decision
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content="Based on the current state, what is your next action? Output valid JSON.")
+        ]
 
-        response = await self.llm.ainvoke(state["messages"])
+        response = await self.llm.ainvoke(messages)
+        response_text = response.content.strip()
 
-        logger.debug(f"[{user_id}/{project_id}/{session_id}] Generated response")
+        # Parse the JSON response into Pydantic model
+        decision = self._parse_llm_decision(response_text)
 
-        return {"messages": [response]}
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Decision: action={decision.action}, tool={decision.tool_name}")
+
+        # Detailed logging for debugging
+        logger.info(f"\n{'='*60}")
+        logger.info(f"THINK NODE - Iteration {iteration} - Phase: {phase}")
+        logger.info(f"{'='*60}")
+        logger.info(f"THOUGHT: {decision.thought[:500]}..." if len(decision.thought) > 500 else f"THOUGHT: {decision.thought}")
+        logger.info(f"REASONING: {decision.reasoning[:300]}..." if len(decision.reasoning) > 300 else f"REASONING: {decision.reasoning}")
+        logger.info(f"ACTION: {decision.action}")
+        if decision.tool_name:
+            logger.info(f"TOOL: {decision.tool_name}")
+            logger.info(f"TOOL_ARGS: {json.dumps(decision.tool_args, indent=2) if decision.tool_args else 'None'}")
+        if decision.phase_transition:
+            logger.info(f"PHASE_TRANSITION: {decision.phase_transition.to_phase}")
+
+        # Log todo list updates
+        if decision.updated_todo_list:
+            logger.info(f"TODO LIST ({len(decision.updated_todo_list)} items):")
+            for todo in decision.updated_todo_list:
+                status_icon = {
+                    "pending": "[ ]",
+                    "in_progress": "[~]",
+                    "completed": "[x]",
+                    "blocked": "[!]"
+                }.get(todo.status, "[ ]")
+                priority_marker = {"high": "!!!", "medium": "!!", "low": "!"}.get(todo.priority, "!!")
+                logger.info(f"  {status_icon} {priority_marker} {todo.description}")
+        else:
+            logger.info(f"TODO LIST: (no updates)")
+        logger.info(f"{'='*60}\n")
+
+        # Create execution step
+        step = ExecutionStep(
+            iteration=iteration,
+            phase=phase,
+            thought=decision.thought,
+            reasoning=decision.reasoning,
+            tool_name=decision.tool_name if decision.action == "use_tool" else None,
+            tool_args=decision.tool_args if decision.action == "use_tool" else None,
+        )
+
+        # Convert todo list updates to dicts for state storage
+        todo_list = [item.model_dump() for item in decision.updated_todo_list] if decision.updated_todo_list else state.get("todo_list", [])
+
+        # Build state updates
+        updates = {
+            "current_iteration": iteration,
+            "todo_list": todo_list,
+            "_current_step": step.model_dump(),
+            "_decision": decision.model_dump(),
+            "_just_transitioned_to": None,  # Clear the marker
+        }
+
+        # Handle different actions
+        if decision.action == "complete":
+            updates["task_complete"] = True
+            updates["completion_reason"] = decision.completion_reason or "Task completed"
+
+        elif decision.action == "transition_phase":
+            phase_transition = decision.phase_transition
+            to_phase = phase_transition.to_phase if phase_transition else "exploitation"
+
+            # Ignore transition to same phase - just continue
+            if to_phase == phase:
+                logger.warning(f"[{user_id}/{project_id}/{session_id}] Ignoring transition to same phase: {phase}")
+                # If in exploitation phase with no tool, default to metasploit search
+                if phase == "exploitation" and not decision.tool_name:
+                    logger.info(f"[{user_id}/{project_id}/{session_id}] Forcing metasploit_console usage in exploitation phase")
+                    updates["_decision"]["action"] = "use_tool"
+                    updates["_decision"]["tool_name"] = "metasploit_console"
+                    # Try to extract CVE from objective for search command
+                    objective = state.get("original_objective", "")
+                    cve_pattern = r'CVE-\d{4}-\d+'
+                    cve_matches = re.findall(cve_pattern, objective, re.IGNORECASE)
+                    if cve_matches:
+                        updates["_decision"]["tool_args"] = {"command": f"search {cve_matches[0]}"}
+                    else:
+                        updates["_decision"]["tool_args"] = {"command": "search type:exploit"}
+                elif decision.tool_name:
+                    updates["_decision"]["action"] = "use_tool"
+                else:
+                    # Loop back for another think iteration
+                    logger.info(f"[{user_id}/{project_id}/{session_id}] Looping back to think")
+                return updates
+
+            # Also ignore if we JUST transitioned to this phase (prevents immediate re-request)
+            if just_transitioned and to_phase == just_transitioned:
+                logger.warning(f"[{user_id}/{project_id}/{session_id}] Ignoring re-request for recent transition to: {to_phase}")
+                # If in exploitation phase with no tool, default to metasploit search
+                if phase == "exploitation" and not decision.tool_name:
+                    logger.info(f"[{user_id}/{project_id}/{session_id}] Forcing metasploit_console usage after transition")
+                    updates["_decision"]["action"] = "use_tool"
+                    updates["_decision"]["tool_name"] = "metasploit_console"
+                    objective = state.get("original_objective", "")
+                    cve_pattern = r'CVE-\d{4}-\d+'
+                    cve_matches = re.findall(cve_pattern, objective, re.IGNORECASE)
+                    if cve_matches:
+                        updates["_decision"]["tool_args"] = {"command": f"search {cve_matches[0]}"}
+                    else:
+                        updates["_decision"]["tool_args"] = {"command": "search type:exploit"}
+                elif decision.tool_name:
+                    updates["_decision"]["action"] = "use_tool"
+                else:
+                    logger.info(f"[{user_id}/{project_id}/{session_id}] Looping back to think")
+                return updates
+
+            # Check if approval is required
+            needs_approval = (
+                (to_phase == "exploitation" and REQUIRE_APPROVAL_FOR_EXPLOITATION) or
+                (to_phase == "post_exploitation" and REQUIRE_APPROVAL_FOR_POST_EXPLOITATION)
+            )
+
+            if needs_approval:
+                updates["phase_transition_pending"] = PhaseTransitionRequest(
+                    from_phase=phase,
+                    to_phase=to_phase,
+                    reason=phase_transition.reason if phase_transition else "",
+                    planned_actions=phase_transition.planned_actions if phase_transition else [],
+                    risks=phase_transition.risks if phase_transition else [],
+                ).model_dump()
+                updates["awaiting_user_approval"] = True
+            else:
+                # Auto-approve if not required
+                updates["current_phase"] = to_phase
+                updates["phase_history"] = state.get("phase_history", []) + [
+                    PhaseHistoryEntry(phase=to_phase).model_dump()
+                ]
+
+        return updates
+
+    async def _execute_tool_node(self, state: AgentState, config = None) -> dict:
+        """Execute the selected tool."""
+        user_id, project_id, session_id = get_identifiers(state, config)
+
+        step_data = state.get("_current_step") or {}
+        tool_name = step_data.get("tool_name")
+        tool_args = step_data.get("tool_args") or {}
+        phase = state.get("current_phase", "informational")
+        iteration = state.get("current_iteration", 0)
+
+        # Detailed logging - tool execution start
+        logger.info(f"\n{'='*60}")
+        logger.info(f"EXECUTE TOOL - Iteration {iteration} - Phase: {phase}")
+        logger.info(f"{'='*60}")
+        logger.info(f"TOOL_NAME: {tool_name}")
+        logger.info(f"TOOL_ARGS:")
+        if tool_args:
+            for key, value in tool_args.items():
+                # Truncate long values for readability
+                val_str = str(value)
+                if len(val_str) > 200:
+                    val_str = val_str[:200] + "..."
+                logger.info(f"  {key}: {val_str}")
+        else:
+            logger.info("  (no arguments)")
+
+        # Handle missing tool name
+        if not tool_name:
+            logger.error(f"[{user_id}/{project_id}/{session_id}] No tool name in step_data")
+            step_data["tool_output"] = "Error: No tool specified"
+            step_data["success"] = False
+            step_data["error_message"] = "No tool name provided"
+            logger.info(f"TOOL_OUTPUT: Error - No tool specified")
+            logger.info(f"{'='*60}\n")
+            return {
+                "_current_step": step_data,
+                "_tool_result": {"success": False, "error": "No tool name provided"},
+            }
+
+        # Set context
+        set_tenant_context(user_id, project_id)
+        set_phase_context(phase)
+
+        # Execute the tool
+        result = await self.tool_executor.execute(tool_name, tool_args, phase)
+
+        # Update step with output (handle None result)
+        if result:
+            step_data["tool_output"] = result.get("output") or ""
+            step_data["success"] = result.get("success", False)
+            step_data["error_message"] = result.get("error")
+        else:
+            step_data["tool_output"] = ""
+            step_data["success"] = False
+            step_data["error_message"] = "Tool execution returned no result"
+
+        # Detailed logging - tool output
+        tool_output = step_data.get("tool_output", "")
+        success = step_data.get("success", False)
+        error_msg = step_data.get("error_message")
+
+        logger.info(f"SUCCESS: {success}")
+        if error_msg:
+            logger.info(f"ERROR: {error_msg}")
+
+        logger.info(f"TOOL_OUTPUT ({len(tool_output)} chars):")
+        if tool_output:
+            # Show first 1000 chars of output for debugging
+            output_preview = tool_output[:1000]
+            for line in output_preview.split('\n')[:20]:  # Max 20 lines
+                logger.info(f"  | {line}")
+            if len(tool_output) > 1000:
+                logger.info(f"  | ... ({len(tool_output) - 1000} more chars)")
+        else:
+            logger.info("  (empty output)")
+        logger.info(f"{'='*60}\n")
+
+        return {
+            "_current_step": step_data,
+            "_tool_result": result or {"success": False, "error": "No result"},
+        }
+
+    async def _analyze_output_node(self, state: AgentState, config = None) -> dict:
+        """Analyze tool output and extract intelligence."""
+        user_id, project_id, session_id = get_identifiers(state, config)
+
+        step_data = state.get("_current_step") or {}
+        tool_output = step_data.get("tool_output") or ""
+        tool_name = step_data.get("tool_name") or "unknown"
+        iteration = state.get("current_iteration", 0)
+        phase = state.get("current_phase", "informational")
+
+        # Handle None or empty tool output
+        if not tool_output:
+            tool_output = step_data.get("error_message") or "No output received from tool"
+
+        # Use LLM to analyze the output (truncate to avoid token limits)
+        analysis_prompt = OUTPUT_ANALYSIS_PROMPT.format(
+            tool_name=tool_name,
+            tool_args=json.dumps(step_data.get("tool_args") or {}),
+            tool_output=tool_output[:TOOL_OUTPUT_MAX_CHARS] if tool_output else "No output",
+            current_target_info=json.dumps(state.get("target_info") or {}, indent=2),
+        )
+
+        response = await self.llm.ainvoke([HumanMessage(content=analysis_prompt)])
+        analysis = self._parse_analysis_response(response.content)
+
+        # Update step with analysis
+        step_data["output_analysis"] = analysis.interpretation
+
+        # Detailed logging - output analysis
+        logger.info(f"\n{'='*60}")
+        logger.info(f"ANALYZE OUTPUT - Iteration {iteration} - Phase: {phase}")
+        logger.info(f"{'='*60}")
+        logger.info(f"TOOL: {tool_name}")
+        logger.info(f"OUTPUT_ANALYSIS:")
+        interpretation = analysis.interpretation or "(no interpretation)"
+        # Show interpretation with nice formatting
+        for line in interpretation.split('\n')[:15]:  # Max 15 lines
+            logger.info(f"  | {line}")
+        if len(interpretation.split('\n')) > 15:
+            logger.info(f"  | ... ({len(interpretation.split(chr(10))) - 15} more lines)")
+
+        # Log extracted info
+        extracted = analysis.extracted_info
+        if extracted:
+            logger.info(f"EXTRACTED INFO:")
+            if extracted.primary_target:
+                logger.info(f"  primary_target: {extracted.primary_target}")
+            if extracted.ports:
+                logger.info(f"  ports: {extracted.ports}")
+            if extracted.services:
+                logger.info(f"  services: {extracted.services}")
+            if extracted.technologies:
+                logger.info(f"  technologies: {extracted.technologies}")
+            if extracted.vulnerabilities:
+                logger.info(f"  vulnerabilities: {extracted.vulnerabilities}")
+            if extracted.credentials:
+                logger.info(f"  credentials: {len(extracted.credentials)} found")
+            if extracted.sessions:
+                logger.info(f"  sessions: {extracted.sessions}")
+
+        # Log actionable findings
+        if analysis.actionable_findings:
+            logger.info(f"ACTIONABLE FINDINGS:")
+            for finding in analysis.actionable_findings[:5]:  # Max 5
+                logger.info(f"  - {finding}")
+
+        # Log recommended next steps
+        if analysis.recommended_next_steps:
+            logger.info(f"RECOMMENDED NEXT STEPS:")
+            for step_rec in analysis.recommended_next_steps[:5]:  # Max 5
+                logger.info(f"  - {step_rec}")
+
+        logger.info(f"{'='*60}\n")
+
+        # Update target info with extracted data
+        current_target = TargetInfo(**state.get("target_info", {}))
+        new_target = TargetInfo(
+            primary_target=extracted.primary_target,
+            ports=extracted.ports,
+            services=extracted.services,
+            technologies=extracted.technologies,
+            vulnerabilities=extracted.vulnerabilities,
+            credentials=extracted.credentials,
+            sessions=extracted.sessions,
+        )
+        merged_target = current_target.merge_from(new_target)
+
+        # Add step to execution trace
+        execution_trace = state.get("execution_trace", []) + [step_data]
+
+        # Add AI message to conversation
+        analysis_summary = analysis.interpretation or tool_output[:500]
+
+        return {
+            "_current_step": step_data,
+            "execution_trace": execution_trace,
+            "target_info": merged_target.model_dump(),
+            "messages": [AIMessage(content=f"**Step {step_data.get('iteration')}** [{state.get('current_phase')}]\n\n{analysis_summary}")],
+        }
+
+    async def _await_approval_node(self, state: AgentState, config = None) -> dict:
+        """Pause and request user approval for phase transition."""
+        user_id, project_id, session_id = get_identifiers(state, config)
+
+        transition = state.get("phase_transition_pending", {})
+
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Awaiting approval for {transition.get('from_phase')} -> {transition.get('to_phase')}")
+
+        # Format the approval message
+        planned_actions = "\n".join(f"- {a}" for a in transition.get("planned_actions", []))
+        risks = "\n".join(f"- {r}" for r in transition.get("risks", []))
+
+        message = PHASE_TRANSITION_MESSAGE.format(
+            from_phase=transition.get("from_phase", "informational"),
+            to_phase=transition.get("to_phase", "exploitation"),
+            reason=transition.get("reason", "No reason provided"),
+            planned_actions=planned_actions or "- No specific actions planned",
+            risks=risks or "- Standard penetration testing risks apply",
+        )
+
+        return {
+            "awaiting_user_approval": True,
+            "messages": [AIMessage(content=message)],
+        }
+
+    async def _process_approval_node(self, state: AgentState, config = None) -> dict:
+        """Process user's approval response."""
+        user_id, project_id, session_id = get_identifiers(state, config)
+
+        approval = state.get("user_approval_response")
+        modification = state.get("user_modification")
+        transition = state.get("phase_transition_pending", {})
+
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Processing approval: {approval}")
+
+        # Common fields to clear approval state - CRITICAL for frontend to close dialog
+        clear_approval_state = {
+            "awaiting_user_approval": False,
+            "phase_transition_pending": None,
+            "user_approval_response": None,
+            "user_modification": None,
+        }
+
+        if approval == "approve":
+            # Transition to new phase
+            new_phase = transition.get("to_phase", "exploitation")
+            logger.info(f"[{user_id}/{project_id}/{session_id}] Transitioning to phase: {new_phase}")
+            return {
+                **clear_approval_state,
+                "current_phase": new_phase,
+                "phase_history": state.get("phase_history", []) + [
+                    PhaseHistoryEntry(phase=new_phase).model_dump()
+                ],
+                "messages": [AIMessage(content=f"Phase transition approved. Now in **{new_phase}** phase.")],
+                # Mark that we just transitioned to prevent re-requesting
+                "_just_transitioned_to": new_phase,
+            }
+
+        elif approval == "modify":
+            # User provided modifications - add to context
+            return {
+                **clear_approval_state,
+                "messages": [
+                    HumanMessage(content=f"User modification: {modification}"),
+                    AIMessage(content="Understood. Adjusting approach based on your feedback."),
+                ],
+            }
+
+        else:  # abort
+            return {
+                **clear_approval_state,
+                "task_complete": True,
+                "completion_reason": "Phase transition cancelled by user",
+                "messages": [AIMessage(content="Phase transition cancelled. Ending session.")],
+            }
+
+    async def _generate_response_node(self, state: AgentState, config = None) -> dict:
+        """Generate final response summarizing the session."""
+        user_id, project_id, session_id = get_identifiers(state, config)
+
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Generating final response...")
+
+        # Build final report prompt
+        report_prompt = FINAL_REPORT_PROMPT.format(
+            objective=state.get("original_objective", ""),
+            iteration_count=state.get("current_iteration", 0),
+            final_phase=state.get("current_phase", "informational"),
+            completion_reason=state.get("completion_reason", "Session ended"),
+            execution_trace=format_execution_trace(state.get("execution_trace", []), last_n=10),
+            target_info=json.dumps(state.get("target_info", {}), indent=2),
+            todo_list=format_todo_list(state.get("todo_list", [])),
+        )
+
+        response = await self.llm.ainvoke([HumanMessage(content=report_prompt)])
+
+        return {
+            "messages": [AIMessage(content=response.content)],
+            "task_complete": True,
+        }
+
+    # =========================================================================
+    # ROUTING FUNCTIONS
+    # =========================================================================
+
+    def _route_after_initialize(self, state: AgentState) -> str:
+        """Route after initialization - process approval if pending, else think."""
+        # If we have an approval response pending, go to process_approval
+        if state.get("user_approval_response") and state.get("phase_transition_pending"):
+            logger.info("Routing to process_approval - approval response pending")
+            return "process_approval"
+
+        return "think"
+
+    def _route_after_think(self, state: AgentState) -> str:
+        """Route based on think node decision."""
+        # Check for max iterations
+        if state.get("current_iteration", 0) >= state.get("max_iterations", MAX_ITERATIONS):
+            logger.info("Max iterations reached, generating response")
+            return "generate_response"
+
+        # Check if task is complete
+        if state.get("task_complete"):
+            return "generate_response"
+
+        # Check if awaiting approval
+        if state.get("awaiting_user_approval"):
+            return "await_approval"
+
+        # Check decision action (may have been modified by _think_node when ignoring transitions)
+        decision = state.get("_decision", {})
+        action = decision.get("action", "use_tool")
+        tool_name = decision.get("tool_name")
+
+        if action == "complete":
+            return "generate_response"
+        elif action == "transition_phase":
+            # If transition is pending, await approval
+            if state.get("phase_transition_pending"):
+                return "await_approval"
+            # Transition was ignored - route based on tool availability
+            if tool_name:
+                logger.info(f"Transition ignored, executing tool: {tool_name}")
+                return "execute_tool"
+            else:
+                logger.info("Transition ignored and no tool, generating response")
+                return "generate_response"
+        elif action == "use_tool" and tool_name:
+            return "execute_tool"
+        else:
+            # No valid action and no tool - end session
+            logger.warning(f"No valid action in decision: {action}, tool: {tool_name}")
+            return "generate_response"
+
+    def _route_after_analyze(self, state: AgentState) -> str:
+        """Route after output analysis."""
+        if state.get("task_complete"):
+            return "generate_response"
+
+        if state.get("current_iteration", 0) >= state.get("max_iterations", MAX_ITERATIONS):
+            return "generate_response"
+
+        return "think"
+
+    def _route_after_approval(self, state: AgentState) -> str:
+        """Route after processing approval."""
+        # If task is complete (abort case), generate response
+        if state.get("task_complete"):
+            return "generate_response"
+
+        # Otherwise continue to think node
+        return "think"
+
+    # =========================================================================
+    # HELPER FUNCTIONS
+    # =========================================================================
+
+    def _extract_json(self, response_text: str) -> Optional[str]:
+        """Extract JSON from LLM response (may be wrapped in markdown)."""
+        json_start = response_text.find("{")
+        json_end = response_text.rfind("}") + 1
+
+        if json_start >= 0 and json_end > json_start:
+            return response_text[json_start:json_end]
+        return None
+
+    def _parse_llm_decision(self, response_text: str) -> LLMDecision:
+        """Parse LLM decision from JSON response using Pydantic validation."""
+        try:
+            json_str = self._extract_json(response_text)
+            if json_str:
+                return LLMDecision.model_validate_json(json_str)
+        except Exception as e:
+            logger.warning(f"Failed to parse LLM decision: {e}")
+
+        # Fallback - return a completion action with error context
+        return LLMDecision(
+            thought=response_text,
+            reasoning="Failed to parse structured response",
+            action="complete",
+            completion_reason="Unable to continue due to response parsing error",
+            updated_todo_list=[],
+        )
+
+    def _parse_analysis_response(self, response_text: str) -> OutputAnalysis:
+        """Parse analysis response from LLM using Pydantic validation."""
+        try:
+            json_str = self._extract_json(response_text)
+            if json_str:
+                return OutputAnalysis.model_validate_json(json_str)
+        except Exception as e:
+            logger.warning(f"Failed to parse analysis response: {e}")
+
+        # Fallback - return basic analysis with raw text
+        return OutputAnalysis(
+            interpretation=response_text,
+            extracted_info=ExtractedTargetInfo(),
+            actionable_findings=[],
+            recommended_next_steps=[],
+        )
+
+    # =========================================================================
+    # PUBLIC API
+    # =========================================================================
 
     async def invoke(
         self,
@@ -234,9 +867,6 @@ class AgentOrchestrator:
 
         logger.info(f"[{user_id}/{project_id}/{session_id}] Invoking with: {question[:50]}...")
 
-        # Set context variables for tenant filtering in graph queries
-        set_tenant_context(user_id, project_id)
-
         try:
             config = create_config(user_id, project_id, session_id)
             input_data = {
@@ -245,37 +875,89 @@ class AgentOrchestrator:
 
             final_state = await self.graph.ainvoke(input_data, config)
 
-            tool_used = None
-            tool_output = None
-
-            for msg in final_state.get("messages", []):
-                if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                    tool_used = msg.tool_calls[0].get('name')
-                if hasattr(msg, 'name') and hasattr(msg, 'content'):
-                    tool_output = msg.content
-
-            final_answer = ""
-            for msg in reversed(final_state.get("messages", [])):
-                if isinstance(msg, AIMessage) and not hasattr(msg, 'name'):
-                    final_answer = msg.content
-                    break
-
-            if not final_answer and tool_output:
-                final_answer = tool_output
-
-            logger.info(f"[{user_id}/{project_id}/{session_id}] Completed. Tool: {tool_used}")
-
-            return InvokeResponse(
-                answer=final_answer,
-                tool_used=tool_used,
-                tool_output=tool_output
-            )
+            return self._build_response(final_state)
 
         except Exception as e:
             logger.error(f"[{user_id}/{project_id}/{session_id}] Error: {e}")
             return InvokeResponse(error=str(e))
 
+    async def resume_after_approval(
+        self,
+        session_id: str,
+        user_id: str,
+        project_id: str,
+        decision: str,
+        modification: Optional[str] = None
+    ) -> InvokeResponse:
+        """Resume execution after user provides approval response."""
+        if not self._initialized:
+            raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
+
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with approval: {decision}")
+
+        try:
+            config = create_config(user_id, project_id, session_id)
+
+            # Get current state from checkpointer
+            current_state = await self.graph.aget_state(config)
+
+            if not current_state or not current_state.values:
+                return InvokeResponse(error="No pending session found")
+
+            # Update state with approval response
+            update_data = {
+                "user_approval_response": decision,
+                "user_modification": modification,
+            }
+
+            # Resume from process_approval node
+            # We need to invoke with the updated state
+            final_state = await self.graph.ainvoke(
+                update_data,
+                config,
+            )
+
+            return self._build_response(final_state)
+
+        except Exception as e:
+            logger.error(f"[{user_id}/{project_id}/{session_id}] Resume error: {e}")
+            return InvokeResponse(error=str(e))
+
+    def _build_response(self, state: dict) -> InvokeResponse:
+        """Build InvokeResponse from final state."""
+        # Extract final answer from messages
+        final_answer = ""
+        tool_used = None
+        tool_output = None
+
+        messages = state.get("messages", [])
+        for msg in reversed(messages):
+            if isinstance(msg, AIMessage):
+                final_answer = msg.content
+                break
+
+        # Get tool info from current step if available
+        step = state.get("_current_step", {})
+        if step:
+            tool_used = step.get("tool_name")
+            tool_output = step.get("tool_output")
+
+        return InvokeResponse(
+            answer=final_answer,
+            tool_used=tool_used,
+            tool_output=tool_output,
+            current_phase=state.get("current_phase", "informational"),
+            iteration_count=state.get("current_iteration", 0),
+            task_complete=state.get("task_complete", False),
+            todo_list=state.get("todo_list", []),
+            execution_trace_summary=summarize_trace_for_response(
+                state.get("execution_trace", [])
+            ),
+            awaiting_approval=state.get("awaiting_user_approval", False),
+            approval_request=state.get("phase_transition_pending"),
+        )
+
     async def close(self) -> None:
         """Clean up resources."""
         self._initialized = False
-        logger.info("AgentOrchestrator closed - placeolder")
+        logger.info("AgentOrchestrator closed")

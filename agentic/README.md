@@ -82,7 +82,7 @@ docker-compose logs -f agent
 
 ### To refresh after code changes
 ```bash
-docker-compose down && docker-compose up --build
+docker-compose restart
 ```
 
 

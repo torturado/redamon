@@ -1,17 +1,11 @@
 'use client'
 
 import { useState, useRef, useEffect, useCallback, KeyboardEvent } from 'react'
-import { Send, Bot, User, Loader2, AlertCircle, Sparkles, RotateCcw } from 'lucide-react'
+import { Send, Bot, User, Loader2, AlertCircle, Sparkles, RotateCcw, Shield, Target, Zap } from 'lucide-react'
 import styles from './AIAssistantDrawer.module.css'
+import type { QueryResponse, PhaseTransitionRequest } from '@/app/api/agent/route'
 
-interface QueryResponse {
-  answer: string
-  tool_used: string | null
-  tool_output: string | null
-  session_id: string
-  message_count: number
-  error: string | null
-}
+type Phase = 'informational' | 'exploitation' | 'post_exploitation'
 
 interface Message {
   id: string
@@ -20,6 +14,7 @@ interface Message {
   toolUsed?: string | null
   toolOutput?: string | null
   error?: string | null
+  phase?: Phase
   timestamp: Date
 }
 
@@ -30,6 +25,27 @@ interface AIAssistantDrawerProps {
   projectId: string
   sessionId: string
   onResetSession?: () => void
+}
+
+const PHASE_CONFIG = {
+  informational: {
+    label: 'Informational',
+    icon: Shield,
+    color: 'var(--accent-primary)',
+    bgColor: 'rgba(59, 130, 246, 0.1)',
+  },
+  exploitation: {
+    label: 'Exploitation',
+    icon: Target,
+    color: 'var(--status-warning)',
+    bgColor: 'rgba(245, 158, 11, 0.1)',
+  },
+  post_exploitation: {
+    label: 'Post-Exploitation',
+    icon: Zap,
+    color: 'var(--status-error)',
+    bgColor: 'rgba(239, 68, 68, 0.1)',
+  },
 }
 
 export function AIAssistantDrawer({
@@ -43,6 +59,12 @@ export function AIAssistantDrawer({
   const [messages, setMessages] = useState<Message[]>([])
   const [inputValue, setInputValue] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [currentPhase, setCurrentPhase] = useState<Phase>('informational')
+  const [iterationCount, setIterationCount] = useState(0)
+  const [awaitingApproval, setAwaitingApproval] = useState(false)
+  const [approvalRequest, setApprovalRequest] = useState<PhaseTransitionRequest | null>(null)
+  const [modificationText, setModificationText] = useState('')
+
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
@@ -55,19 +77,44 @@ export function AIAssistantDrawer({
   }, [messages, scrollToBottom])
 
   useEffect(() => {
-    if (isOpen && inputRef.current) {
+    if (isOpen && inputRef.current && !awaitingApproval) {
       setTimeout(() => inputRef.current?.focus(), 300)
     }
-  }, [isOpen])
+  }, [isOpen, awaitingApproval])
 
   // Reset messages when session changes
   useEffect(() => {
     setMessages([])
+    setCurrentPhase('informational')
+    setIterationCount(0)
+    setAwaitingApproval(false)
+    setApprovalRequest(null)
   }, [sessionId])
+
+  const handleResponse = (response: QueryResponse) => {
+    // Update state from response
+    setCurrentPhase(response.current_phase)
+    setIterationCount(response.iteration_count)
+    setAwaitingApproval(response.awaiting_approval)
+    setApprovalRequest(response.approval_request)
+
+    const assistantMessage: Message = {
+      id: `assistant-${Date.now()}`,
+      role: 'assistant',
+      content: response.answer,
+      toolUsed: response.tool_used,
+      toolOutput: response.tool_output,
+      error: response.error,
+      phase: response.current_phase,
+      timestamp: new Date(),
+    }
+
+    setMessages((prev) => [...prev, assistantMessage])
+  }
 
   const handleSend = async () => {
     const question = inputValue.trim()
-    if (!question || isLoading) return
+    if (!question || isLoading || awaitingApproval) return
 
     const userMessage: Message = {
       id: `user-${Date.now()}`,
@@ -98,23 +145,67 @@ export function AIAssistantDrawer({
       }
 
       const response: QueryResponse = await res.json()
-
-      const assistantMessage: Message = {
-        id: `assistant-${Date.now()}`,
-        role: 'assistant',
-        content: response.answer,
-        toolUsed: response.tool_used,
-        toolOutput: response.tool_output,
-        error: response.error,
-        timestamp: new Date(),
-      }
-
-      setMessages((prev) => [...prev, assistantMessage])
+      handleResponse(response)
     } catch (error) {
       const errorMessage: Message = {
         id: `error-${Date.now()}`,
         role: 'assistant',
         content: 'Sorry, I encountered an error while processing your request.',
+        error: error instanceof Error ? error.message : 'Unknown error',
+        timestamp: new Date(),
+      }
+
+      setMessages((prev) => [...prev, errorMessage])
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
+  const handleApproval = async (decision: 'approve' | 'modify' | 'abort') => {
+    // Close the approval dialog immediately - don't wait for API response
+    setAwaitingApproval(false)
+    setApprovalRequest(null)
+    setIsLoading(true)
+
+    // Add a message showing the user's decision
+    const decisionMessage: Message = {
+      id: `decision-${Date.now()}`,
+      role: 'user',
+      content: decision === 'approve'
+        ? 'Approved phase transition'
+        : decision === 'modify'
+        ? `Modified: ${modificationText}`
+        : 'Aborted phase transition',
+      timestamp: new Date(),
+    }
+    setMessages((prev) => [...prev, decisionMessage])
+
+    try {
+      const res = await fetch('/api/agent/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          user_id: userId,
+          project_id: projectId,
+          decision,
+          modification: decision === 'modify' ? modificationText : undefined,
+        }),
+      })
+
+      if (!res.ok) {
+        const errorData = await res.json().catch(() => ({}))
+        throw new Error(errorData.error || `Approval error: ${res.status}`)
+      }
+
+      const response: QueryResponse = await res.json()
+      setModificationText('')
+      handleResponse(response)
+    } catch (error) {
+      const errorMessage: Message = {
+        id: `error-${Date.now()}`,
+        role: 'assistant',
+        content: 'Error processing approval.',
         error: error instanceof Error ? error.message : 'Unknown error',
         timestamp: new Date(),
       }
@@ -141,8 +232,14 @@ export function AIAssistantDrawer({
 
   const handleNewChat = () => {
     setMessages([])
+    setCurrentPhase('informational')
+    setIterationCount(0)
+    setAwaitingApproval(false)
+    setApprovalRequest(null)
     onResetSession?.()
   }
+
+  const PhaseIcon = PHASE_CONFIG[currentPhase].icon
 
   return (
     <div
@@ -177,6 +274,25 @@ export function AIAssistantDrawer({
             &times;
           </button>
         </div>
+      </div>
+
+      {/* Phase Indicator */}
+      <div className={styles.phaseIndicator}>
+        <div
+          className={styles.phaseBadge}
+          style={{
+            backgroundColor: PHASE_CONFIG[currentPhase].bgColor,
+            borderColor: PHASE_CONFIG[currentPhase].color,
+          }}
+        >
+          <PhaseIcon size={14} style={{ color: PHASE_CONFIG[currentPhase].color }} />
+          <span style={{ color: PHASE_CONFIG[currentPhase].color }}>
+            {PHASE_CONFIG[currentPhase].label}
+          </span>
+        </div>
+        {iterationCount > 0 && (
+          <span className={styles.iterationCount}>Step {iterationCount}</span>
+        )}
       </div>
 
       {/* Messages */}
@@ -224,6 +340,19 @@ export function AIAssistantDrawer({
               {message.role === 'user' ? <User size={14} /> : <Bot size={14} />}
             </div>
             <div className={styles.messageContent}>
+              {/* Phase badge for assistant messages */}
+              {message.role === 'assistant' && message.phase && (
+                <div
+                  className={styles.messagePhaseBadge}
+                  style={{
+                    backgroundColor: PHASE_CONFIG[message.phase].bgColor,
+                    color: PHASE_CONFIG[message.phase].color,
+                  }}
+                >
+                  {PHASE_CONFIG[message.phase].label}
+                </div>
+              )}
+
               <div className={styles.messageText}>
                 {message.content.split('\n').map((line, i) => (
                   <p key={i}>{line || '\u00A0'}</p>
@@ -236,7 +365,6 @@ export function AIAssistantDrawer({
                   <span>{message.error}</span>
                 </div>
               )}
-
             </div>
           </div>
         ))}
@@ -258,6 +386,76 @@ export function AIAssistantDrawer({
         <div ref={messagesEndRef} />
       </div>
 
+      {/* Approval Dialog */}
+      {awaitingApproval && approvalRequest && (
+        <div className={styles.approvalDialog}>
+          <div className={styles.approvalHeader}>
+            <AlertCircle size={16} />
+            <span>Phase Transition Request</span>
+          </div>
+          <div className={styles.approvalContent}>
+            <p className={styles.approvalTransition}>
+              <span className={styles.approvalFrom}>{approvalRequest.from_phase}</span>
+              <span className={styles.approvalArrow}>→</span>
+              <span className={styles.approvalTo}>{approvalRequest.to_phase}</span>
+            </p>
+            <p className={styles.approvalReason}>{approvalRequest.reason}</p>
+
+            {approvalRequest.planned_actions.length > 0 && (
+              <div className={styles.approvalSection}>
+                <strong>Planned Actions:</strong>
+                <ul>
+                  {approvalRequest.planned_actions.map((action, i) => (
+                    <li key={i}>{action}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {approvalRequest.risks.length > 0 && (
+              <div className={styles.approvalSection}>
+                <strong>Risks:</strong>
+                <ul>
+                  {approvalRequest.risks.map((risk, i) => (
+                    <li key={i}>{risk}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            <textarea
+              className={styles.modificationInput}
+              placeholder="Optional: provide modification feedback..."
+              value={modificationText}
+              onChange={(e) => setModificationText(e.target.value)}
+            />
+          </div>
+          <div className={styles.approvalActions}>
+            <button
+              className={`${styles.approvalButton} ${styles.approvalButtonApprove}`}
+              onClick={() => handleApproval('approve')}
+              disabled={isLoading}
+            >
+              Approve
+            </button>
+            <button
+              className={`${styles.approvalButton} ${styles.approvalButtonModify}`}
+              onClick={() => handleApproval('modify')}
+              disabled={isLoading || !modificationText.trim()}
+            >
+              Modify
+            </button>
+            <button
+              className={`${styles.approvalButton} ${styles.approvalButtonAbort}`}
+              onClick={() => handleApproval('abort')}
+              disabled={isLoading}
+            >
+              Abort
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Input */}
       <div className={styles.inputContainer}>
         <div className={styles.inputWrapper}>
@@ -267,14 +465,14 @@ export function AIAssistantDrawer({
             value={inputValue}
             onChange={handleInputChange}
             onKeyDown={handleKeyDown}
-            placeholder="Ask a question..."
+            placeholder={awaitingApproval ? "Respond to the approval request above..." : "Ask a question..."}
             rows={1}
-            disabled={isLoading}
+            disabled={isLoading || awaitingApproval}
           />
           <button
             className={styles.sendButton}
             onClick={handleSend}
-            disabled={!inputValue.trim() || isLoading}
+            disabled={!inputValue.trim() || isLoading || awaitingApproval}
             aria-label="Send message"
           >
             {isLoading ? <Loader2 size={16} className={styles.spinner} /> : <Send size={16} />}

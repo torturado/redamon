@@ -12,6 +12,9 @@ services:
       - .env
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - ./logs:/app/logs  # Persist logs to host
+      - .:/app  # Mount code for development (hot reload with restart)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]

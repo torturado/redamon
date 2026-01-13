@@ -2,18 +2,25 @@
 RedAmon Agent Tools
 
 MCP tools and Neo4j graph query tool definitions.
+Includes phase-aware tool management.
 """
 
 import re
 import logging
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional, Dict, TYPE_CHECKING
 from contextvars import ContextVar
 
 from langchain_core.tools import tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_neo4j import Neo4jGraph
 
-from params import MCP_CURL_URL, CYPHER_MAX_RETRIES
+from params import (
+    MCP_CURL_URL,
+    MCP_NAABU_URL,
+    MCP_METASPLOIT_URL,
+    CYPHER_MAX_RETRIES,
+    is_tool_allowed_in_phase,
+)
 from prompts import TEXT_TO_CYPHER_SYSTEM
 
 if TYPE_CHECKING:
@@ -21,9 +28,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# CONTEXT VARIABLES
+# =============================================================================
+
 # Context variables to pass user_id and project_id to tools
 current_user_id: ContextVar[str] = ContextVar('current_user_id', default='')
 current_project_id: ContextVar[str] = ContextVar('current_project_id', default='')
+current_phase: ContextVar[str] = ContextVar('current_phase', default='informational')
 
 
 def set_tenant_context(user_id: str, project_id: str) -> None:
@@ -32,12 +44,34 @@ def set_tenant_context(user_id: str, project_id: str) -> None:
     current_project_id.set(project_id)
 
 
+def set_phase_context(phase: str) -> None:
+    """Set the current phase context for tool restrictions."""
+    current_phase.set(phase)
+
+
+def get_phase_context() -> str:
+    """Get the current phase context."""
+    return current_phase.get()
+
+
+# =============================================================================
+# MCP TOOLS MANAGER
+# =============================================================================
+
 class MCPToolsManager:
     """Manages MCP (Model Context Protocol) tool connections."""
 
-    def __init__(self, curl_url: str = MCP_CURL_URL):
+    def __init__(
+        self,
+        curl_url: str = MCP_CURL_URL,
+        naabu_url: str = MCP_NAABU_URL,
+        metasploit_url: str = MCP_METASPLOIT_URL,
+    ):
         self.curl_url = curl_url
+        self.naabu_url = naabu_url
+        self.metasploit_url = metasploit_url
         self.client: Optional[MultiServerMCPClient] = None
+        self._tools_cache: Dict[str, any] = {}
 
     async def get_tools(self) -> List:
         """
@@ -46,35 +80,68 @@ class MCPToolsManager:
         Returns:
             List of MCP tools available for use
         """
-        logger.info(f"Connecting to MCP curl server at {self.curl_url}")
+        logger.info("Connecting to MCP servers...")
 
-        try:
-            self.client = MultiServerMCPClient({
-                "curl": {
-                    "url": self.curl_url,
+        mcp_servers = {}
+        all_tools = []
+
+        # Try to connect to each MCP server
+        server_configs = [
+            ("curl", self.curl_url),
+            ("naabu", self.naabu_url),
+            ("metasploit", self.metasploit_url),
+        ]
+
+        for server_name, url in server_configs:
+            try:
+                logger.info(f"Connecting to MCP {server_name} server at {url}")
+                mcp_servers[server_name] = {
+                    "url": url,
                     "transport": "sse",
                 }
-            })
+            except Exception as e:
+                logger.warning(f"Failed to configure MCP server {server_name}: {e}")
 
+        if not mcp_servers:
+            logger.warning("No MCP servers configured")
+            return []
+
+        try:
+            self.client = MultiServerMCPClient(mcp_servers)
             mcp_tools = await self.client.get_tools()
-            logger.info(f"Loaded {len(mcp_tools)} tools from MCP server")
-            return mcp_tools
+
+            # Cache tools by name for easy access
+            for tool in mcp_tools:
+                tool_name = getattr(tool, 'name', str(tool))
+                self._tools_cache[tool_name] = tool
+                all_tools.append(tool)
+
+            logger.info(f"Loaded {len(all_tools)} tools from MCP servers: {list(self._tools_cache.keys())}")
+            return all_tools
 
         except Exception as e:
-            logger.error(f"Failed to connect to MCP server: {e}")
+            logger.error(f"Failed to connect to MCP servers: {e}")
             logger.warning("Continuing without MCP tools")
             return []
 
+    def get_tool_by_name(self, name: str) -> Optional[any]:
+        """Get a specific tool by name."""
+        return self._tools_cache.get(name)
+
+    def get_available_tools_for_phase(self, phase: str) -> List:
+        """Get tools that are allowed in the current phase."""
+        return [
+            tool for name, tool in self._tools_cache.items()
+            if is_tool_allowed_in_phase(name, phase)
+        ]
+
+
+# =============================================================================
+# NEO4J TOOL MANAGER
+# =============================================================================
 
 class Neo4jToolManager:
     """Manages Neo4j graph query tool with tenant filtering."""
-
-    # Node types that require tenant filtering (exclude CVE which is global)
-    TENANT_NODES = {
-        'Domain', 'Subdomain', 'IP', 'Port', 'Service', 'BaseURL',
-        'Technology', 'Vulnerability', 'Endpoint', 'Parameter',
-        'Header', 'DNSRecord', 'Certificate', 'MitreData', 'Capec'
-    }
 
     def __init__(self, uri: str, user: str, password: str, llm: "ChatOpenAI"):
         self.uri = uri
@@ -90,6 +157,15 @@ class Neo4jToolManager:
         This ensures all queries are scoped to the current user's project,
         preventing cross-tenant data access.
 
+        Strategy: Add tenant properties directly into each node pattern as inline
+        property filters. This ensures filters are always in scope regardless of
+        WITH clauses or query structure.
+
+        Example:
+            MATCH (d:Domain {name: "example.com"})
+        becomes:
+            MATCH (d:Domain {name: "example.com", user_id: $tenant_user_id, project_id: $tenant_project_id})
+
         Args:
             cypher: The AI-generated Cypher query
             user_id: Current user's ID
@@ -98,48 +174,35 @@ class Neo4jToolManager:
         Returns:
             Modified Cypher query with tenant filters applied
         """
-        # Find all node variable declarations in MATCH clauses
+        tenant_props = "user_id: $tenant_user_id, project_id: $tenant_project_id"
+
+        def add_tenant_to_node(match: re.Match) -> str:
+            """Add tenant properties to a node pattern."""
+            var_name = match.group(1)
+            label = match.group(2)
+            existing_props_content = match.group(3)  # Content INSIDE braces (without braces), or None
+
+            if existing_props_content is not None:
+                # Has existing properties - merge with tenant props
+                existing_props_content = existing_props_content.strip()
+                if existing_props_content:
+                    # Append tenant props after existing ones
+                    new_props = f"{{{existing_props_content}, {tenant_props}}}"
+                else:
+                    new_props = f"{{{tenant_props}}}"
+                return f"({var_name}:{label} {new_props})"
+            else:
+                # No existing properties, add them
+                return f"({var_name}:{label} {{{tenant_props}}})"
+
         # Pattern matches: (variable:Label) or (variable:Label {props})
-        node_pattern = r'\((\w+):(\w+)(?:\s*\{[^}]*\})?\)'
+        # Captures: 1=variable, 2=label, 3=optional content INSIDE braces (without braces)
+        # Uses a non-greedy match for the props content
+        node_pattern = r'\((\w+):(\w+)(?:\s*\{([^}]*)\})?\)'
 
-        # Find all node variables that need filtering
-        matches = re.findall(node_pattern, cypher)
-        filter_vars = []
-        for var_name, label in matches:
-            if label in self.TENANT_NODES:
-                filter_vars.append(var_name)
+        result = re.sub(node_pattern, add_tenant_to_node, cypher)
 
-        if not filter_vars:
-            return cypher
-
-        # Build the tenant filter clause
-        tenant_conditions = []
-        for var in set(filter_vars):  # Use set to avoid duplicates
-            tenant_conditions.append(f"{var}.user_id = $tenant_user_id")
-            tenant_conditions.append(f"{var}.project_id = $tenant_project_id")
-
-        tenant_filter = " AND ".join(tenant_conditions)
-
-        # Inject the filter into the query
-        # If WHERE exists, add to it; otherwise insert WHERE before RETURN/WITH/ORDER/LIMIT
-        if re.search(r'\bWHERE\b', cypher, re.IGNORECASE):
-            # Add to existing WHERE clause
-            cypher = re.sub(
-                r'(\bWHERE\b\s+)',
-                rf'\1({tenant_filter}) AND ',
-                cypher,
-                count=1,
-                flags=re.IGNORECASE
-            )
-        else:
-            # Insert WHERE before RETURN, WITH, ORDER BY, or LIMIT
-            insert_pattern = r'(\s*)(RETURN|WITH|ORDER\s+BY|LIMIT)'
-            match = re.search(insert_pattern, cypher, re.IGNORECASE)
-            if match:
-                insert_pos = match.start()
-                cypher = cypher[:insert_pos] + f" WHERE {tenant_filter} " + cypher[insert_pos:]
-
-        return cypher
+        return result
 
     async def _generate_cypher(
         self,
@@ -185,9 +248,11 @@ Common fixes:
 ## Current Database Schema
 {schema}
 {error_context}
-## Important
+## Important Rules
 - Generate ONLY the Cypher query, no explanations
 - Do NOT include user_id or project_id filters - they will be added automatically
+- Do NOT use any parameters (like $target, $domain, etc.) - use literal values or no filters
+- If the question doesn't specify a target, query ALL matching data
 - Always use LIMIT to restrict results
 
 User Question: {question}
@@ -234,6 +299,9 @@ Cypher Query:"""
                 - Technologies detected on targets
                 - Vulnerabilities and CVEs found
                 - Any other security reconnaissance data
+
+                This is the PRIMARY source of truth for target information.
+                Always query the graph FIRST before using other tools.
 
                 Args:
                     question: Natural language question about the data
@@ -306,3 +374,113 @@ Cypher Query:"""
             logger.error(f"Failed to set up Neo4j: {e}")
             logger.warning("Continuing without graph query tool")
             return None
+
+
+# =============================================================================
+# PHASE-AWARE TOOL EXECUTOR
+# =============================================================================
+
+class PhaseAwareToolExecutor:
+    """
+    Executes tools with phase-awareness.
+    Validates that tools are allowed in the current phase before execution.
+    """
+
+    def __init__(self, mcp_manager: MCPToolsManager, graph_tool: Optional[callable]):
+        self.mcp_manager = mcp_manager
+        self.graph_tool = graph_tool
+        self._all_tools: Dict[str, callable] = {}
+
+        # Register graph tool
+        if graph_tool:
+            self._all_tools["query_graph"] = graph_tool
+
+    def register_mcp_tools(self, tools: List) -> None:
+        """Register MCP tools after they're loaded."""
+        for tool in tools:
+            tool_name = getattr(tool, 'name', None)
+            if tool_name:
+                self._all_tools[tool_name] = tool
+
+    async def execute(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        phase: str
+    ) -> dict:
+        """
+        Execute a tool if allowed in the current phase.
+
+        Args:
+            tool_name: Name of the tool to execute
+            tool_args: Arguments for the tool
+            phase: Current agent phase
+
+        Returns:
+            dict with 'success', 'output', and optionally 'error'
+        """
+        # Check phase restriction
+        if not is_tool_allowed_in_phase(tool_name, phase):
+            return {
+                "success": False,
+                "output": None,
+                "error": f"Tool '{tool_name}' is not allowed in '{phase}' phase. "
+                         f"This tool requires: {get_phase_for_tool(tool_name)}"
+            }
+
+        # Get the tool
+        tool = self._all_tools.get(tool_name)
+        if not tool:
+            return {
+                "success": False,
+                "output": None,
+                "error": f"Tool '{tool_name}' not found"
+            }
+
+        try:
+            # Execute the tool
+            if tool_name == "query_graph":
+                # Graph tool expects 'question' argument
+                question = tool_args.get("question", "")
+                output = await tool.ainvoke(question)
+            else:
+                # MCP tools - invoke with the appropriate argument
+                output = await tool.ainvoke(tool_args)
+
+            return {
+                "success": True,
+                "output": str(output),
+                "error": None
+            }
+
+        except Exception as e:
+            logger.error(f"Tool execution failed: {tool_name} - {e}")
+            return {
+                "success": False,
+                "output": None,
+                "error": str(e)
+            }
+
+    def get_all_tools(self) -> List:
+        """Get all registered tools."""
+        return list(self._all_tools.values())
+
+    def get_tools_for_phase(self, phase: str) -> List:
+        """Get tools allowed in the given phase."""
+        return [
+            tool for name, tool in self._all_tools.items()
+            if is_tool_allowed_in_phase(name, phase)
+        ]
+
+
+def get_phase_for_tool(tool_name: str) -> str:
+    """Get the minimum phase required for a tool."""
+    from params import TOOL_PHASE_MAP
+    allowed_phases = TOOL_PHASE_MAP.get(tool_name, [])
+    if "informational" in allowed_phases:
+        return "informational"
+    elif "exploitation" in allowed_phases:
+        return "exploitation"
+    elif "post_exploitation" in allowed_phases:
+        return "post_exploitation"
+    return "unknown"

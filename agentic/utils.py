@@ -163,7 +163,7 @@ def create_config(
     }
 
 
-def get_config_values(config: dict) -> tuple[str, str, str]:
+def get_config_values(config) -> tuple[str, str, str]:
     """
     Extract user_id, project_id, session_id from config.
 
@@ -172,17 +172,76 @@ def get_config_values(config: dict) -> tuple[str, str, str]:
         logger.info(f"[{user_id}/{project_id}/{session_id}] Processing...")
 
     Args:
-        config: The config dict passed to graph nodes
+        config: The config dict or RunnableConfig passed to graph nodes
 
     Returns:
         Tuple of (user_id, project_id, session_id)
     """
-    configurable = config.get("configurable", {})
-    return (
-        configurable.get("user_id", "unknown"),
-        configurable.get("project_id", "unknown"),
-        configurable.get("session_id", "unknown")
-    )
+    if config is None:
+        return ("unknown", "unknown", "unknown")
+
+    # LangGraph passes RunnableConfig - try multiple ways to access configurable
+    configurable = None
+
+    # Method 1: Direct dict access
+    if isinstance(config, dict):
+        configurable = config.get("configurable", {})
+    # Method 2: RunnableConfig object with configurable attribute
+    elif hasattr(config, 'configurable'):
+        configurable = config.configurable or {}
+    # Method 3: Try .get() method (duck typing)
+    elif hasattr(config, 'get'):
+        configurable = config.get("configurable", {})
+
+    if configurable is None:
+        return ("unknown", "unknown", "unknown")
+
+    # Extract values from configurable
+    if isinstance(configurable, dict):
+        return (
+            configurable.get("user_id", "unknown"),
+            configurable.get("project_id", "unknown"),
+            configurable.get("session_id", "unknown")
+        )
+    elif hasattr(configurable, 'get'):
+        return (
+            configurable.get("user_id", "unknown"),
+            configurable.get("project_id", "unknown"),
+            configurable.get("session_id", "unknown")
+        )
+    else:
+        return (
+            getattr(configurable, "user_id", "unknown"),
+            getattr(configurable, "project_id", "unknown"),
+            getattr(configurable, "session_id", "unknown")
+        )
+
+
+def get_identifiers(state: AgentState, config = None) -> tuple[str, str, str]:
+    """
+    Get user_id, project_id, session_id from config with state fallback.
+
+    This is the preferred method for nodes - it tries config first,
+    then falls back to state values (set by _initialize_node).
+
+    Args:
+        state: The AgentState containing user/project/session from initialization
+        config: Optional config dict from LangGraph
+
+    Returns:
+        Tuple of (user_id, project_id, session_id)
+    """
+    user_id, project_id, session_id = get_config_values(config)
+
+    # Fallback to state values if config doesn't have them
+    if user_id == "unknown":
+        user_id = state.get("user_id", "unknown")
+    if project_id == "unknown":
+        project_id = state.get("project_id", "unknown")
+    if session_id == "unknown":
+        session_id = state.get("session_id", "unknown")
+
+    return (user_id, project_id, session_id)
 
 
 def extract_response(state: AgentState) -> Dict[str, Any]:

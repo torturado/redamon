@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from 'next/server'
 
 const AGENT_API_BASE_URL = process.env.AGENT_API_URL || process.env.NEXT_PUBLIC_AGENT_API_URL || 'http://localhost:8080'
 
+// =============================================================================
+// REQUEST INTERFACES
+// =============================================================================
+
 export interface QueryRequest {
   question: string
   user_id: string
@@ -9,14 +13,70 @@ export interface QueryRequest {
   session_id: string
 }
 
+export interface ApprovalRequest {
+  session_id: string
+  user_id: string
+  project_id: string
+  decision: 'approve' | 'modify' | 'abort'
+  modification?: string
+}
+
+// =============================================================================
+// RESPONSE INTERFACES
+// =============================================================================
+
+export interface TodoItem {
+  id: string
+  description: string
+  status: 'pending' | 'in_progress' | 'completed' | 'blocked'
+  priority: 'high' | 'medium' | 'low'
+}
+
+export interface ExecutionStepSummary {
+  iteration: number
+  phase: string
+  thought: string
+  tool_name: string | null
+  success: boolean
+  output_summary: string
+}
+
+export interface PhaseTransitionRequest {
+  from_phase: string
+  to_phase: string
+  reason: string
+  planned_actions: string[]
+  risks: string[]
+}
+
 export interface QueryResponse {
+  // Core response fields
   answer: string
   tool_used: string | null
   tool_output: string | null
   session_id: string
   message_count: number
   error: string | null
+
+  // ReAct state fields
+  current_phase: 'informational' | 'exploitation' | 'post_exploitation'
+  iteration_count: number
+  task_complete: boolean
+
+  // Todo list
+  todo_list: TodoItem[]
+
+  // Execution trace summary
+  execution_trace_summary: ExecutionStepSummary[]
+
+  // Approval flow fields
+  awaiting_approval: boolean
+  approval_request: PhaseTransitionRequest | null
 }
+
+// =============================================================================
+// API HANDLERS
+// =============================================================================
 
 export async function POST(request: NextRequest) {
   try {
