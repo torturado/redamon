@@ -100,6 +100,8 @@ export function AIAssistantDrawer({
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const isProcessingApproval = useRef(false)
+  const awaitingApprovalRef = useRef(false)
 
   const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -127,6 +129,8 @@ export function AIAssistantDrawer({
     setAnswerText('')
     setSelectedOptions([])
     setTodoList([])
+    awaitingApprovalRef.current = false
+    isProcessingApproval.current = false
   }, [sessionId])
 
   // WebSocket message handler
@@ -224,6 +228,14 @@ export function AIAssistantDrawer({
         break
 
       case MessageType.APPROVAL_REQUEST:
+        // Ignore duplicate approval requests if we're already awaiting or just processed one
+        if (awaitingApprovalRef.current || isProcessingApproval.current) {
+          console.log('Ignoring duplicate approval request - already processing')
+          break
+        }
+
+        console.log('Received approval request:', message.payload)
+        awaitingApprovalRef.current = true
         setAwaitingApproval(true)
         setApprovalRequest(message.payload)
         setIsLoading(false)
@@ -320,10 +332,14 @@ export function AIAssistantDrawer({
   }, [inputValue, isConnected, awaitingApproval, awaitingQuestion, sendQuery])
 
   const handleApproval = useCallback((decision: 'approve' | 'modify' | 'abort') => {
-    // Prevent double submission
-    if (!awaitingApproval) {
+    // Prevent double submission using ref (immediate check, not async state)
+    if (!awaitingApproval || isProcessingApproval.current || !awaitingApprovalRef.current) {
       return
     }
+
+    // Mark as processing immediately
+    isProcessingApproval.current = true
+    awaitingApprovalRef.current = false
 
     setAwaitingApproval(false)
     setApprovalRequest(null)
@@ -347,8 +363,15 @@ export function AIAssistantDrawer({
       setModificationText('')
     } catch (error) {
       setIsLoading(false)
+      awaitingApprovalRef.current = false
+      isProcessingApproval.current = false
+    } finally {
+      // Reset the processing flag after a delay to prevent backend from sending duplicate
+      setTimeout(() => {
+        isProcessingApproval.current = false
+      }, 1000)
     }
-  }, [modificationText, sendApproval, awaitingApproval, chatItems.length])
+  }, [modificationText, sendApproval, awaitingApproval])
 
   const handleAnswer = useCallback(() => {
     if (!questionRequest) return
@@ -403,6 +426,8 @@ export function AIAssistantDrawer({
     setAnswerText('')
     setSelectedOptions([])
     setTodoList([])
+    awaitingApprovalRef.current = false
+    isProcessingApproval.current = false
     onResetSession?.()
   }
 
