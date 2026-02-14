@@ -1348,7 +1348,7 @@ flowchart LR
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `OPENAI_MODEL` | `"gpt-5.2"` | LLM model for reasoning |
+| `OPENAI_MODEL` | `"gpt-5.2"` | LLM model for reasoning. Supports OpenAI, Claude, and Gemini (`gemini-3-flash-preview`, `gemini-3-pro-preview`) |
 | `MAX_ITERATIONS` | `100` | Maximum ReAct loop iterations |
 | `EXECUTION_TRACE_MEMORY_STEPS` | `100` | How many steps to include in LLM context |
 | `TOOL_OUTPUT_MAX_CHARS` | `20000` | Truncate tool output for LLM analysis |
@@ -1371,7 +1371,9 @@ flowchart LR
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `OPENAI_API_KEY` | Yes | OpenAI API key for LLM calls |
+| `OPENAI_API_KEY` | If using OpenAI models | OpenAI API key for LLM calls |
+| `ANTHROPIC_API_KEY` | If using Claude models | Anthropic API key for Claude models |
+| `GOOGLE_API_KEY` | If using Gemini models | Google API key for Gemini models |
 | `NEO4J_URI` | Yes | Neo4j connection URI |
 | `NEO4J_USER` | Yes | Neo4j username |
 | `NEO4J_PASSWORD` | Yes | Neo4j password |

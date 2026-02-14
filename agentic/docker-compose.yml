@@ -1,6 +1,6 @@
 # RedAmon Agent Docker Compose (standalone)
 # For full stack, use the root docker-compose.yml instead.
-# API keys: set ANTHROPIC_API_KEY / OPENAI_API_KEY in your environment.
+# API keys: set ANTHROPIC_API_KEY / OPENAI_API_KEY / GOOGLE_API_KEY in your environment.
 
 services:
   agent:
@@ -18,6 +18,7 @@ services:
       # AI provider keys (from environment)
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       # WebSocket config
       WS_HEARTBEAT_INTERVAL: "30"

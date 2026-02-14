@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
@@ -79,6 +80,11 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+SUPPORTED_GEMINI_MODELS = {
+    "gemini-3-flash-preview",
+    "gemini-3-pro-preview",
+}
+
 
 class AgentOrchestrator:
     """
@@ -95,6 +101,7 @@ class AgentOrchestrator:
         """Initialize the orchestrator with configuration."""
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+        self.google_api_key = os.getenv("GOOGLE_API_KEY")
         self.neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         self.neo4j_user = os.getenv("NEO4J_USER", "neo4j")
         self.neo4j_password = os.getenv("NEO4J_PASSWORD")
@@ -138,8 +145,9 @@ class AgentOrchestrator:
                 logger.info("Updated Neo4j tool LLM")
 
     def _setup_llm(self) -> None:
-        """Initialize the LLM based on model name (OpenAI or Anthropic)."""
+        """Initialize the LLM based on model name (OpenAI, Anthropic, or Gemini)."""
         logger.info(f"Setting up LLM: {self.model_name}")
+        provider_name = "OpenAI"
 
         if self.model_name.startswith("claude-"):
             if not self.anthropic_api_key:
@@ -152,6 +160,18 @@ class AgentOrchestrator:
                 temperature=0,
                 max_tokens=4096,
             )
+            provider_name = "Anthropic"
+        elif self.model_name in SUPPORTED_GEMINI_MODELS:
+            if not self.google_api_key:
+                raise ValueError(
+                    f"GOOGLE_API_KEY environment variable is required for model '{self.model_name}'"
+                )
+            self.llm = ChatGoogleGenerativeAI(
+                model=self.model_name,
+                google_api_key=self.google_api_key,
+                temperature=0,
+            )
+            provider_name = "Gemini"
         else:
             if not self.openai_api_key:
                 raise ValueError(
@@ -163,7 +183,7 @@ class AgentOrchestrator:
                 temperature=0,
             )
 
-        logger.info(f"LLM provider: {'Anthropic' if self.model_name.startswith('claude-') else 'OpenAI'}")
+        logger.info(f"LLM provider: {provider_name}")
 
     async def _setup_tools(self) -> None:
         """Set up all tools (MCP and Neo4j)."""
@@ -330,8 +350,12 @@ class AgentOrchestrator:
             if current_idx < len(objectives):
                 current_objective_content = objectives[current_idx].get("content", "")
 
+            # Ensure we are dealing with strings for comparison
+            latest_message_str = str(latest_message).strip() if latest_message else ""
+            current_obj_str = str(current_objective_content).strip() if current_objective_content else ""
+
             # New objective if: task was completed, OR index out of bounds, OR message differs from current objective
-            is_different_message = latest_message.strip() != current_objective_content.strip()
+            is_different_message = latest_message_str != current_obj_str
 
             logger.debug(f"[{user_id}/{project_id}/{session_id}] New objective check: task_complete={task_was_complete}, "
                         f"idx={current_idx}, len={len(objectives)}, is_different={is_different_message}")
@@ -571,7 +595,13 @@ class AgentOrchestrator:
                 ))
 
             response = await self.llm.ainvoke(messages)
-            response_text = response.content.strip()
+            
+            # Handle different content types (string vs list of blocks)
+            if isinstance(response.content, list):
+                # Extract text content from blocks if it's a list
+                response_text = "".join([block.get("text", "") if isinstance(block, dict) else str(block) for block in response.content]).strip()
+            else:
+                response_text = response.content.strip() if response.content else ""
 
             # Log the raw LLM response
             logger.info(f"\n{'='*60}")

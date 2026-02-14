@@ -22,12 +22,21 @@ echo ""
 # Check Docker Socket Access
 # =============================================================================
 echo -e "${YELLOW}[*] Checking Docker socket access...${NC}"
+ls -la /var/run/docker.sock || true
 
 if [ -S /var/run/docker.sock ]; then
+    # Attempt to fix permissions if not accessible (e.g. if mounted with wrong GID)
+    if ! docker info > /dev/null 2>&1; then
+        echo -e "${YELLOW}[*] Attempting to fix Docker socket permissions...${NC}"
+        chmod 666 /var/run/docker.sock 2>/dev/null || true
+    fi
+
     if docker info > /dev/null 2>&1; then
         echo -e "${GREEN}[+] Docker socket accessible${NC}"
+        docker info | grep "Server Version" || true
     else
         echo -e "${RED}[!] Docker socket exists but not accessible${NC}"
+        docker info 2>&1 || true
         echo -e "${RED}    Make sure the container has permissions to access Docker${NC}"
         echo -e "${RED}    Try: docker-compose up with the docker group or root${NC}"
     fi

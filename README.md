@@ -50,8 +50,10 @@ Edit `.env` and add at least one AI provider key:
 ANTHROPIC_API_KEY=sk-ant-...   # recommended
 # or
 OPENAI_API_KEY=sk-proj-...
+# or
+GOOGLE_API_KEY=AIza...
 ```
-Get your key from [Anthropic Console](https://console.anthropic.com/) or [OpenAI Platform](https://platform.openai.com/api-keys).
+Get your key from [Anthropic Console](https://console.anthropic.com/), [OpenAI Platform](https://platform.openai.com/api-keys), or [Google AI Studio](https://aistudio.google.com/app/apikey).
 
 **Optional keys** (add these for extra capabilities):
 ```env
@@ -765,7 +767,7 @@ Configure the AI agent orchestrator that performs autonomous pentesting. Control
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| LLM Model | gpt-5.2 | The language model powering the agent. Supports Anthropic (Claude Opus 4.6, Sonnet 4.5, Haiku 4.5) and OpenAI (GPT-5.2, GPT-5, GPT-4.1 families). Anthropic models require ANTHROPIC_API_KEY |
+| LLM Model | gpt-5.2 | The language model powering the agent. Supports Anthropic (Claude Opus 4.6, Sonnet 4.5, Haiku 4.5), OpenAI (GPT-5.2, GPT-5, GPT-4.1 families), and Gemini (`gemini-3-flash-preview`, `gemini-3-pro-preview`). Claude models require `ANTHROPIC_API_KEY`; Gemini models require `GOOGLE_API_KEY` |
 | Post-Exploitation Type | statefull | `statefull` — keeps Meterpreter sessions between turns. `stateless` — executes one-shot commands |
 | Activate Post-Exploitation Phase | true | Whether post-exploitation is available at all. When disabled, the agent stops after exploitation |
 | Informational Phase System Prompt | — | Custom instructions injected during the informational/recon phase. Leave empty for default |
@@ -976,7 +978,7 @@ flowchart TB
             subgraph AgenticContainer["agentic-container"]
                 FastAPI[FastAPI :8090]
                 LangGraph[LangGraph Engine]
-                Claude[Claude AI]
+                LLM[LLM Providers]
             end
 
             subgraph Neo4jContainer["neo4j-container"]

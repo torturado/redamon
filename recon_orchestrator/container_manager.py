@@ -97,12 +97,20 @@ class ContainerManager:
                         if exit_code == 0:
                             state.status = ReconStatus.COMPLETED
                             state.completed_at = datetime.now(timezone.utc)
+                            logger.info(f"Container for project {project_id} completed successfully")
                         else:
                             state.status = ReconStatus.ERROR
-                            state.error = f"Container exited with code {exit_code}"
+                            # Capture last few lines of logs on error
+                            try:
+                                error_logs = container.logs(tail=20).decode("utf-8", errors="replace")
+                                state.error = f"Container exited with code {exit_code}. Logs:\n{error_logs}"
+                            except Exception:
+                                state.error = f"Container exited with code {exit_code}"
                             state.completed_at = datetime.now(timezone.utc)
+                            logger.error(f"Container for project {project_id} failed: {state.error}")
 
                         # Auto-cleanup: remove finished container
+
                         try:
                             container.remove()
                             logger.info(f"Auto-removed finished container for project {project_id}")
@@ -140,9 +148,14 @@ class ContainerManager:
         project_id: str,
         user_id: str,
         webapp_api_url: str,
-        recon_path: str = "/home/samuele/Progetti didattici/RedAmon/recon",
+        recon_path: str = os.environ.get("RECON_PATH", "/app/recon"),
+        host_recon_path: str = os.environ.get("HOST_RECON_PATH", ""),
     ) -> ReconState:
         """Start a recon container for a project"""
+
+        # Use host path if provided, otherwise fallback to recon_path (assumes host/container paths are same)
+        mount_path = Path(host_recon_path or recon_path).as_posix()
+
 
         # Check if already running
         current_state = await self.get_status(project_id)
@@ -171,9 +184,18 @@ class ContainerManager:
             try:
                 self.client.images.get(self.recon_image)
             except NotFound:
-                logger.info(f"Building recon image from {recon_path}")
+                recon_path_obj = Path(recon_path)
+                if (recon_path_obj / "recon" / "Dockerfile").exists():
+                    build_context = recon_path_obj.as_posix()
+                    dockerfile = "recon/Dockerfile"
+                else:
+                    build_context = recon_path_obj.parent.as_posix()
+                    dockerfile = f"{recon_path_obj.name}/Dockerfile"
+
+                logger.info(f"Building recon image from {build_context}")
                 self.client.images.build(
-                    path=recon_path,
+                    path=build_context,
+                    dockerfile=dockerfile,
                     tag=self.recon_image,
                     rm=True,
                 )
@@ -184,6 +206,8 @@ class ContainerManager:
                 name=container_name,
                 detach=True,
                 network_mode="host",
+                privileged=True,
+                user="root",
                 cap_add=["NET_RAW", "NET_ADMIN"],
                 environment={
                     "PROJECT_ID": project_id,
@@ -192,7 +216,7 @@ class ContainerManager:
                     "UPDATE_GRAPH_DB": "true",
                     # HOST_RECON_OUTPUT_PATH: Required for nested Docker containers (naabu, httpx, etc.)
                     # These run as sibling containers and need host paths for volume mounts
-                    "HOST_RECON_OUTPUT_PATH": f"{recon_path}/output",
+                    "HOST_RECON_OUTPUT_PATH": f"{mount_path}/output",
                     # Forward credentials from orchestrator environment
                     "NVD_API_KEY": os.environ.get("NVD_API_KEY", ""),
                     "NEO4J_URI": os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
@@ -200,17 +224,19 @@ class ContainerManager:
                     "NEO4J_PASSWORD": os.environ.get("NEO4J_PASSWORD", ""),
                 },
                 volumes={
-                    "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "ro"},
+                    "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
                     # Mount source code for development (no rebuild needed)
                     # Note: rw needed because output/data are subdirectories
-                    f"{recon_path}": {"bind": "/app/recon", "mode": "rw"},
+                    f"{mount_path}": {"bind": "/app/recon", "mode": "rw"},
                     # Mount graph_db module
-                    f"{Path(recon_path).parent}/graph_db": {"bind": "/app/graph_db", "mode": "ro"},
+                    f"{Path(mount_path).parent}/graph_db": {"bind": "/app/graph_db", "mode": "ro"},
+
                     # Mount /tmp for Docker-in-Docker temp files (avoids spaces in paths)
                     "/tmp/redamon": {"bind": "/tmp/redamon", "mode": "rw"},
                 },
-                command="python /app/recon/main.py",
+                command=["python", "/app/recon/main.py"],
             )
+
 
             state.container_id = container.id
             state.status = ReconStatus.RUNNING
@@ -544,8 +570,15 @@ class ContainerManager:
         webapp_api_url: str,
         recon_path: str,
         gvm_scan_path: str,
+        host_recon_path: str = os.environ.get("HOST_RECON_PATH", ""),
+        host_gvm_scan_path: str = os.environ.get("HOST_GVM_SCAN_PATH", ""),
     ) -> GvmState:
         """Start a GVM vulnerability scanner container for a project"""
+
+        # Use host paths if provided, otherwise fallback to internal paths
+        mount_recon_path = Path(host_recon_path or recon_path).as_posix()
+        mount_gvm_path = Path(host_gvm_scan_path or gvm_scan_path).as_posix()
+
 
         # Check if already running
         current_state = await self.get_gvm_status(project_id)
@@ -606,16 +639,17 @@ class ContainerManager:
                     # GVM socket for communicating with gvmd
                     "redamon_gvmd_socket": {"bind": "/run/gvmd", "mode": "ro"},
                     # Recon output (read-only, for extracting targets)
-                    f"{recon_path}/output": {"bind": "/app/recon/output", "mode": "ro"},
+                    f"{mount_recon_path}/output": {"bind": "/app/recon/output", "mode": "ro"},
                     # GVM scan output (read-write, for saving results)
-                    f"{gvm_scan_path}/output": {"bind": "/app/gvm_scan/output", "mode": "rw"},
+                    f"{mount_gvm_path}/output": {"bind": "/app/gvm_scan/output", "mode": "rw"},
                     # Mount graph_db module for Neo4j updates
-                    f"{Path(recon_path).parent}/graph_db": {"bind": "/app/graph_db", "mode": "ro"},
+                    f"{Path(mount_recon_path).parent}/graph_db": {"bind": "/app/graph_db", "mode": "ro"},
                     # Mount gvm_scan source for development (no rebuild needed)
-                    f"{gvm_scan_path}": {"bind": "/app/gvm_scan", "mode": "rw"},
+                    f"{mount_gvm_path}": {"bind": "/app/gvm_scan", "mode": "rw"},
                 },
-                command="python gvm_scan/main.py",
+                command=["python", "gvm_scan/main.py"],
             )
+
 
             state.container_id = container.id
             state.status = GvmStatus.RUNNING
@@ -868,8 +902,13 @@ class ContainerManager:
         user_id: str,
         webapp_api_url: str,
         github_hunt_path: str,
+        host_github_hunt_path: str = os.environ.get("HOST_GITHUB_HUNT_PATH", ""),
     ) -> GithubHuntState:
         """Start a GitHub secret hunt container for a project"""
+
+        # Use host paths if provided, otherwise fallback to internal paths
+        mount_github_hunt_path = Path(host_github_hunt_path or github_hunt_path).as_posix()
+
 
         # Check if already running
         current_state = await self.get_github_hunt_status(project_id)
@@ -924,14 +963,15 @@ class ContainerManager:
                 },
                 volumes={
                     # GitHub hunt output (read-write, for saving results)
-                    f"{github_hunt_path}/output": {"bind": "/app/github_secret_hunt/output", "mode": "rw"},
+                    f"{mount_github_hunt_path}/output": {"bind": "/app/github_secret_hunt/output", "mode": "rw"},
                     # Mount github_secret_hunt source for development (no rebuild needed)
-                    f"{github_hunt_path}": {"bind": "/app/github_secret_hunt", "mode": "rw"},
+                    f"{mount_github_hunt_path}": {"bind": "/app/github_secret_hunt", "mode": "rw"},
                     # Mount graph_db module for Neo4j integration
-                    f"{Path(github_hunt_path).parent}/graph_db": {"bind": "/app/graph_db", "mode": "ro"},
+                    f"{Path(mount_github_hunt_path).parent}/graph_db": {"bind": "/app/graph_db", "mode": "ro"},
                 },
-                command="python github_secret_hunt/main.py",
+                command=["python", "github_secret_hunt/main.py"],
             )
+
 
             state.container_id = container.id
             state.status = GithubHuntStatus.RUNNING

@@ -51,6 +51,10 @@ export function AgentBehaviourSection({ data, updateField }: AgentBehaviourSecti
                     <option value="claude-sonnet-4-5-20250929">Claude Sonnet 4.5 — Balanced performance</option>
                     <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5 — Fast and efficient</option>
                   </optgroup>
+                  <optgroup label="Google Gemini">
+                    <option value="gemini-3-flash-preview">gemini-3-flash-preview - Fast and cost-efficient</option>
+                    <option value="gemini-3-pro-preview">gemini-3-pro-preview - Most capable Gemini model</option>
+                  </optgroup>
                   <optgroup label="GPT-5.2">
                     <option value="gpt-5.2">gpt-5.2 — Flagship reasoning model</option>
                     <option value="gpt-5.2-pro">gpt-5.2-pro — Smarter, more precise (Responses API)</option>
@@ -66,7 +70,7 @@ export function AgentBehaviourSection({ data, updateField }: AgentBehaviourSecti
                     <option value="gpt-4.1-nano">gpt-4.1-nano — Fastest, cheapest</option>
                   </optgroup>
                 </select>
-                <span className={styles.fieldHint}>Model used by the agent. Anthropic models require ANTHROPIC_API_KEY in the agent .env file.</span>
+                <span className={styles.fieldHint}>Model used by the agent. Claude models require ANTHROPIC_API_KEY, Gemini models require GOOGLE_API_KEY.</span>
               </div>
               <div className={styles.fieldGroup}>
                 <label className={styles.fieldLabel}>Post-Exploitation Type</label>

@@ -133,7 +133,9 @@ services:
   gvm-redis:
     image: registry.community.greenbone.net/community/redis-server
     container_name: redamon-gvm-redis
+    user: "0"
     restart: on-failure
+
     volumes:
       - gvm_redis_socket:/run/redis/
 
@@ -238,16 +240,20 @@ services:
       - ./recon_orchestrator:/app
       - ./recon:/app/recon:ro
       - ./recon/output:/app/recon/output:rw
+      - ./graph_db:/app/graph_db:ro
       - ./gvm_scan:/app/gvm_scan:ro
       - ./gvm_scan/output:/app/gvm_scan/output:rw
       - ./github_secret_hunt:/app/github_secret_hunt:ro
       - ./github_secret_hunt/output:/app/github_secret_hunt/output:rw
     environment:
-      RECON_PATH: ${PWD}/recon
+      RECON_PATH: /app/recon
+      HOST_RECON_PATH: ${PWD}/recon
       RECON_IMAGE: redamon-recon:latest
-      GVM_SCAN_PATH: ${PWD}/gvm_scan
+      GVM_SCAN_PATH: /app/gvm_scan
+      HOST_GVM_SCAN_PATH: ${PWD}/gvm_scan
       GVM_IMAGE: redamon-vuln-scanner:latest
-      GITHUB_HUNT_PATH: ${PWD}/github_secret_hunt
+      GITHUB_HUNT_PATH: /app/github_secret_hunt
+      HOST_GITHUB_HUNT_PATH: ${PWD}/github_secret_hunt
       GITHUB_HUNT_IMAGE: redamon-github-hunter:latest
       # Forwarded to spawned recon containers (host network, so localhost)
       NVD_API_KEY: ${NVD_API_KEY:-}
@@ -330,6 +336,7 @@ services:
       # AI provider keys (from root .env)
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
       TAVILY_API_KEY: ${TAVILY_API_KEY:-}
       # WebSocket config
       WS_HEARTBEAT_INTERVAL: "30"

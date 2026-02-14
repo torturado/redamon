@@ -264,12 +264,17 @@ User Question: {question}
 Cypher Query:"""
 
         response = await self.llm.ainvoke(prompt)
-        cypher = response.content.strip()
+        
+        # Handle different content types (string vs list of blocks)
+        if isinstance(response.content, list):
+            cypher = "".join([block.get("text", "") if isinstance(block, dict) else str(block) for block in response.content]).strip()
+        else:
+            cypher = response.content.strip() if response.content else ""
 
         # Clean up the response - remove markdown code blocks if present
         if cypher.startswith("```"):
             lines = cypher.split("\n")
-            cypher = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+            cypher = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
         return cypher.strip()
 
